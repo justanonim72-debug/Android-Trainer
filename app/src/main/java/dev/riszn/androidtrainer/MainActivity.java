@@ -36,6 +36,7 @@ import java.util.zip.ZipInputStream;
 public final class MainActivity extends Activity {
     private static final int REQ_BUNDLE = 1001;
     private static final int REQ_REPORT = 1002;
+    private static final int REQ_CRASH_TRACE = 1003;
 
     static {
         System.loadLibrary("android_trainer");
@@ -45,6 +46,7 @@ public final class MainActivity extends Activity {
     private Button run;
     private File bundleDir;
     private String lastReport = "";
+    private File lastNativeTrace;
     private PowerManager powerManager;
 
     private static native String nativeProbe();
@@ -93,6 +95,10 @@ public final class MainActivity extends Activity {
         Button export = button("Export last JSON report");
         export.setOnClickListener(v -> exportReport());
         buttons.addView(export);
+
+        Button exportCrash = button("Export native crash trace");
+        exportCrash.setOnClickListener(v -> exportNativeTrace());
+        buttons.addView(exportCrash);
 
         root.addView(buttons, new LinearLayout.LayoutParams(-1, -2));
 
@@ -148,6 +154,31 @@ public final class MainActivity extends Activity {
             append("rss_kb: " + chosen.getRss());
             String d = chosen.getDescription();
             if (d != null && !d.isEmpty()) append("description: " + d);
+
+            // Android 12+ exposes this app's native crash tombstone as the
+            // platform Tombstone protobuf. Capture it verbatim; do not parse
+            // or transform it in-process, so the forensic artifact stays exact.
+            if (Build.VERSION.SDK_INT >= 31 &&
+                chosen.getReason() == ApplicationExitInfo.REASON_CRASH_NATIVE) {
+                try (InputStream trace = chosen.getTraceInputStream()) {
+                    if (trace == null) {
+                        append("native_tombstone: unavailable_or_overwritten");
+                    } else {
+                        File tomb = new File(
+                                getFilesDir(),
+                                "native_tombstone_" + chosen.getTimestamp() + ".pb");
+                        try (OutputStream out = new BufferedOutputStream(new FileOutputStream(tomb))) {
+                            copy(trace, out);
+                        }
+                        lastNativeTrace = tomb;
+                        append("native_tombstone_bytes: " + tomb.length());
+                        append("native_tombstone_sha256: " + sha256(tomb));
+                        append("native_tombstone_ready: YES");
+                    }
+                } catch (Throwable t) {
+                    append("native_tombstone_capture_error: " + t);
+                }
+            }
         } catch (Throwable t) {
             append("exit diagnostic unavailable: " + t);
         }
@@ -217,6 +248,7 @@ public final class MainActivity extends Activity {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         if (requestCode == REQ_BUNDLE) importBundle(data.getData());
         if (requestCode == REQ_REPORT) writeReport(data.getData());
+        if (requestCode == REQ_CRASH_TRACE) writeNativeTrace(data.getData());
     }
 
     private void importBundle(Uri uri) {
@@ -349,6 +381,33 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "Report exported", Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
             append("REPORT EXPORT FAIL: " + t);
+        }
+    }
+
+    private void exportNativeTrace() {
+        if (lastNativeTrace == null || !lastNativeTrace.isFile()) {
+            Toast.makeText(this, "No native tombstone captured", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/octet-stream");
+        i.putExtra(Intent.EXTRA_TITLE, lastNativeTrace.getName());
+        startActivityForResult(i, REQ_CRASH_TRACE);
+    }
+
+    private void writeNativeTrace(Uri uri) {
+        if (lastNativeTrace == null || !lastNativeTrace.isFile()) {
+            append("CRASH TRACE EXPORT FAIL: no captured tombstone");
+            return;
+        }
+        try (InputStream in = new BufferedInputStream(new FileInputStream(lastNativeTrace));
+             OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+            if (out == null) throw new IllegalStateException("null crash trace stream");
+            copy(in, out);
+            Toast.makeText(this, "Native crash trace exported", Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            append("CRASH TRACE EXPORT FAIL: " + t);
         }
     }
 
