@@ -112,9 +112,10 @@ Bundle Bundle::load(const std::string& rootDir) {
     require(!b.manifest.HasParseError() && b.manifest.IsObject(), "invalid manifest.json");
 
     b.schema = asString(b.manifest, "schema");
-    require(b.schema == "android_trainer_bundle_v1", "unsupported bundle schema " + b.schema);
+    require(b.schema == "android_trainer_bundle_v2", "unsupported bundle schema " + b.schema);
     b.checkpointSha256 = asString(b.manifest, "checkpoint_sha256");
     b.trainBinSha256 = asString(b.manifest, "train_bin_sha256");
+    b.modelStateSha256 = asString(b.manifest, "model_state_sha256");
     b.ropeStyle = asString(b.manifest, "rope_style");
     require(b.ropeStyle == "half_split" || b.ropeStyle == "interleaved" || b.ropeStyle == "auto", "unsupported RoPE style");
     require(b.manifest.HasMember("parameter_count") && b.manifest["parameter_count"].IsInt64(), "bad parameter_count");
@@ -145,10 +146,17 @@ Bundle Bundle::load(const std::string& rootDir) {
     b.adam.beta1 = asDouble(a, "beta1");
     b.adam.beta2 = asDouble(a, "beta2");
     b.adam.eps = asDouble(a, "eps");
-    b.adam.weightDecay = asDouble(a, "weight_decay");
     b.adam.gateLr = asDouble(a, "gate_lr");
+    require(a.HasMember("slot_weight_decay") && a["slot_weight_decay"].IsObject(),
+            "optimizer missing slot_weight_decay");
+    for (auto it = a["slot_weight_decay"].MemberBegin(); it != a["slot_weight_decay"].MemberEnd(); ++it) {
+        require(it->name.IsString() && it->value.IsNumber(), "bad slot_weight_decay entry");
+        const double wd = it->value.GetDouble();
+        require(std::isfinite(wd) && wd >= 0.0, "invalid slot weight decay");
+        b.adam.slotWeightDecay[it->name.GetString()] = wd;
+    }
     require(b.adam.beta1 > 0 && b.adam.beta1 < 1 && b.adam.beta2 > 0 && b.adam.beta2 < 1 &&
-            b.adam.eps > 0 && b.adam.gateLr > 0 && b.adam.weightDecay >= 0,
+            b.adam.eps > 0 && b.adam.gateLr > 0,
             "invalid AdamW config");
 
     require(b.manifest.HasMember("reference") && b.manifest["reference"].IsObject(), "missing reference");
@@ -193,6 +201,12 @@ Bundle Bundle::load(const std::string& rootDir) {
     }
 
     require(b.tensors.size() == 1u + 8u * 9u + 1u, "unexpected normalized tensor-slot count");
+    require(b.adam.slotWeightDecay.size() == b.tensors.size(),
+            "slot_weight_decay count does not match tensor slots");
+    for (const auto& kv : b.tensors) {
+        require(b.adam.slotWeightDecay.find(kv.first) != b.adam.slotWeightDecay.end(),
+                "missing slot weight decay: " + kv.first);
+    }
     return b;
 }
 
