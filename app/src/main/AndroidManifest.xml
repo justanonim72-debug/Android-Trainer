@@ -1,13 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-native-library android:name="libOpenCL.so" android:required="false" />
-    <uses-native-library android:name="libGLES_mali.so" android:required="false" />
+
     <application
         android:allowBackup="false"
         android:extractNativeLibs="false"
         android:label="Android Trainer"
         android:theme="@style/AppTheme">
+
+        <!-- Android requires uses-native-library inside <application>. optional keeps installation portable. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libGLES_mali.so" android:required="false" />
+
         <activity android:name=".MainActivity" android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
