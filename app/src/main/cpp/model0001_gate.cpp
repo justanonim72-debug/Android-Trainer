@@ -310,7 +310,6 @@ UpdateExpressions oneStepExpressions(Graph& g,const std::map<VARP,VARP>& gm,cons
     const float b1=static_cast<float>(b.adam.beta1);
     const float b2=static_cast<float>(b.adam.beta2);
     const float eps=static_cast<float>(b.adam.eps);
-    const float wd=static_cast<float>(b.adam.weightDecay);
     const float bc1=1.0f-b1, bc2=1.0f-b2;
     for(const auto& kv:g.params) {
         auto it=gm.find(kv.second); req(it!=gm.end(),"missing gradient "+kv.first);
@@ -321,6 +320,7 @@ UpdateExpressions oneStepExpressions(Graph& g,const std::map<VARP,VARP>& gm,cons
         auto v=(scalar(1.0f-b2))*_Square(gg);
         auto denom=_Sqrt(v)/scalar(std::sqrt(bc2))+scalar(eps);
         auto adam=m/scalar(bc1)/denom;
+        const float wd=static_cast<float>(b.adam.slotWeightDecay.at(kv.first));
         auto np=kv.second*scalar(1.0f-lr*wd)-scalar(lr)*adam;
         u.pnew.emplace(kv.first,np);
     }
@@ -418,7 +418,7 @@ StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
 
     const float lr=static_cast<float>(b.adam.gateLr);
     const float b1=static_cast<float>(b.adam.beta1), b2=static_cast<float>(b.adam.beta2);
-    const float eps=static_cast<float>(b.adam.eps), wd=static_cast<float>(b.adam.weightDecay);
+    const float eps=static_cast<float>(b.adam.eps);
 
     std::vector<VARP> oldState,newState;
     // Pow states contain beta^step for the step being applied; start at beta^1.
@@ -434,6 +434,7 @@ StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
         auto vn=scalar(b2)*v+scalar(1.0f-b2)*_Square(gg);
         auto denom=_Sqrt(vn)/_Sqrt(scalar(1.0f)-b2pow)+scalar(eps);
         auto stepSize=scalar(lr)/(scalar(1.0f)-b1pow);
+        const float wd=static_cast<float>(b.adam.slotWeightDecay.at(pk.first));
         auto pn=pk.second*scalar(1.0f-lr*wd)-stepSize*mn/denom;
         pn->setName("update."+pk.first);
         mn->setName("update.adamw.m."+pk.first);
@@ -676,6 +677,7 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v1\""
          <<",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT<<"\""
          <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
+         <<",\"model_state_sha256\":\""<<b.modelStateSha256<<"\""
          <<",\"rope_evidence\":\""<<jsonEscape(ropeEvidence)<<"\""
          <<",\"thermal_headroom_start\":"<<thermalHeadroom
          <<",\"opencl_runtime\":"<<openClProbe()
@@ -689,7 +691,7 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
          <<",\"canonical_2x\":{\"opencl\":"<<(clCanonical?"true":"false")
          <<",\"vulkan_buffer\":"<<(vkCanonical?"true":"false")<<"}"
          <<",\"recommended_backend\":\""<<winner<<"\""
-         <<",\"note\":\"Benchmark is exact Model #0001 FP32 forward/backward/decoupled-AdamW; backend switch remains stage-boundary only.\"}";
+         <<",\"note\":\"Benchmark is exact Model #0001 FP32 forward/backward/fresh-state decoupled AdamW with checkpoint-derived per-parameter decay grouping; backend switch remains stage-boundary only.\"}";
         return o.str();
     } catch(const std::exception& e) {
         return std::string("{\"status\":\"FAIL\",\"error\":\"")+jsonEscape(e.what())+"\"}";
