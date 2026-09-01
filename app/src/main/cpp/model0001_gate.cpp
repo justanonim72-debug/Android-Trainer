@@ -121,10 +121,15 @@ std::pair<VARP,VARP> rope(VARP q, VARP k, const Bundle& b) {
 }
 
 VARP repeatKv(VARP x) {
-    // [1,2,S,64] -> [1,2,1,S,64] -> tile repetition axis -> [1,6,S,64].
+    // Preserve exact GQA repeat semantics while staying inside MNN 3.6.1's
+    // registered autograd surface. OpType_Tile has no gradient registration in
+    // the pinned MNN train module, while BroadcastTo does. Broadcasting
+    // [1,2,1,S,64] -> [1,2,3,S,64] and then reshaping is elementwise identical
+    // to Tile(reps=[1,1,3,1,1]); its backward is the required sum over repeats.
     auto e = _Reshape(x, {1,HKV,1,S,HD});
-    auto reps = _Const(std::vector<int32_t>{1,1,HQ/HKV,1,1}.data(), {5}, NHWC, halide_type_of<int32_t>());
-    return _Reshape(_Tile(e, reps), {1,HQ,S,HD});
+    int32_t shapeData[5] = {1,HKV,HQ/HKV,S,HD};
+    auto shape = _Const(shapeData, {5}, NHWC, halide_type_of<int32_t>());
+    return _Reshape(_BroadcastTo(e, shape), {1,HQ,S,HD});
 }
 
 VARP causalMask() {
@@ -184,7 +189,12 @@ Graph buildGraph(const Bundle& b) {
         x=x+linear(a,ow);
 
         h=rmsNorm(x,fn,static_cast<float>(b.config.rmsNormEps));
-        auto ffv=_Silu(linear(h,gw))*linear(h,uw);
+        // Pinned MNN 3.6.1 exposes forward SiLU but its UnaryGrad does not
+        // implement UnaryOpOperation_SILU. Spell SiLU as x*sigmoid(x), which is
+        // mathematically identical and uses BinaryOp + SIGMOID gradients that
+        // are registered in this exact MNN commit.
+        auto gate=linear(h,gw);
+        auto ffv=(gate*_Sigmoid(gate))*linear(h,uw);
         x=x+linear(ffv,dw);
     }
     auto finalNorm=addP("final_norm.weight");
@@ -257,12 +267,27 @@ struct Parity {
     std::string error;
 };
 
+void requireCompleteGradients(const Graph& g,const std::map<VARP,VARP>& gm,const std::string& label) {
+    if(gm.size()==g.params.size()) return;
+    std::ostringstream o;
+    o<<label<<": MNN autograd incomplete: got "<<gm.size()<<"/"<<g.params.size()<<" parameter gradients; missing=[";
+    bool first=true;
+    for(const auto& kv:g.params) {
+        if(gm.find(kv.second)!=gm.end()) continue;
+        if(!first) o<<",";
+        first=false;
+        o<<kv.first;
+    }
+    o<<"]";
+    throw std::runtime_error(o.str());
+}
+
 std::map<VARP,VARP> gradients(Graph& g) {
     OpGrad::init();
     std::set<VARP> ps;
     for(auto& kv:g.params) ps.insert(kv.second);
     auto m=OpGrad::grad(g.loss,ps);
-    req(m.size()==g.params.size(),"MNN autograd did not return every parameter gradient");
+    requireCompleteGradients(g,m,"dynamic parity");
     return m;
 }
 
@@ -422,7 +447,7 @@ StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
     OpGrad::init();
     std::set<VARP> pset; for(auto& kv:g.params) pset.insert(kv.second);
     auto gm=OpGrad::grad(g.loss,pset);
-    req(gm.size()==g.params.size(),"static AdamW: incomplete gradient map");
+    requireCompleteGradients(g,gm,"static AdamW");
 
     VARP sum=scalar(0.0f);
     for(auto& kv:gm) sum=sum+_ReduceSum(_Square(kv.second),{},false);
@@ -684,9 +709,11 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
                 std::to_string(thermalHeadroom)+",\"cpu_parity\":"+parityJson(cpu)+"}";
         }
 
-        // 2) Exact dynamic graph parity on GPU candidates.
+        // 2) Exact dynamic graph parity on the approved GPU candidate.
+        // Project policy keeps Vulkan out of training; OpenCL is the only GPU
+        // backend evaluated for migration.
         Parity cl=safeDynamicParity(b,MNN_FORWARD_OPENCL,MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
-        Parity vk=safeDynamicParity(b,MNN_FORWARD_VULKAN,MNN_GPU_TUNING_WIDE);
+        Parity vk; vk.backend="VULKAN"; vk.pass=false; vk.error="disabled_by_project_policy";
 
         // 3) Serialize one backend-neutral static AdamW training loop and benchmark
         // independent fresh sessions. This avoids timing MNN's dynamic graph rebuild path.
@@ -700,12 +727,12 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
                                        MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
         else { bg.backend="OPENCL"; }
         Bench bv;
-        if(vk.pass) bv=safeBenchStatic(b,base,workDir,MNN_FORWARD_VULKAN,MNN_GPU_TUNING_WIDE,steps);
-        else { bv.backend="VULKAN"; }
+        bv.backend="VULKAN";
+        bv.error="disabled_by_project_policy";
 
         const double cpuT=bc.tokps;
         const double clRatio=(cpuT>0&&bg.tokps>0)?bg.tokps/cpuT:0.0;
-        const double vkRatio=(cpuT>0&&bv.tokps>0)?bv.tokps/cpuT:0.0;
+        const double vkRatio=0.0;
 
         // Acceptance is deliberately evidence-based, not "GPU did not crash".
         // 1.5x is reported as useful; 2x is the recommended canonical-switch threshold.
@@ -715,9 +742,7 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         const bool vkCanonical=vk.pass&&bv.finite&&bv.checkpointReloadOk&&vkRatio>=2.0;
 
         std::string winner="CPU";
-        double best=1.0;
-        if(clCanonical&&clRatio>best){winner="OPENCL";best=clRatio;}
-        if(vkCanonical&&vkRatio>best){winner="VULKAN_BUFFER";best=vkRatio;}
+        if(clCanonical){winner="OPENCL";}
 
         std::ostringstream o;
         o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v1\""
