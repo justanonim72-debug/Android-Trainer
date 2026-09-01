@@ -446,7 +446,7 @@ StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
     oldState.insert(oldState.end(),{b1pow,b2pow}); newState.insert(newState.end(),{b1n,b2n});
 
     g.loss->setName("loss"); norm->setName("global_grad_norm");
-    ParameterOptimizer::makeLoopModel(path.c_str(),{g.loss,norm},{oldState,newState});
+    MNN::Train::ParameterOptimizer::makeLoopModel(path.c_str(),{g.loss,norm},{oldState,newState});
     std::ifstream f(path,std::ios::binary|std::ios::ate);
     req(f&&f.tellg()>0,"static train model serialization failed");
     return {path};
