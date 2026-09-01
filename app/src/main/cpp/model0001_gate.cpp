@@ -254,6 +254,7 @@ struct Parity {
     double maxLogitAbs=0, maxGradProbeAbs=0, maxGradProbeRel=0, maxAdamAbs=0, maxAdamRel=0;
     BackendCounts counts;
     bool pass=false;
+    std::string error;
 };
 
 std::map<VARP,VARP> gradients(Graph& g) {
@@ -381,6 +382,18 @@ Parity dynamicParity(const Bundle& b,MNNForwardType type,int gpuMode) {
     return p;
 }
 
+Parity safeDynamicParity(const Bundle& b,MNNForwardType type,int gpuMode) {
+    try {
+        return dynamicParity(b,type,gpuMode);
+    } catch(const std::exception& e) {
+        Parity p;
+        p.backend=typeName(type);
+        p.pass=false;
+        p.error=e.what();
+        return p;
+    }
+}
+
 std::string parityJson(const Parity& p) {
     std::ostringstream o;
     o<<"{\"backend\":\""<<p.backend<<"\",\"pass\":"<<(p.pass?"true":"false")
@@ -393,7 +406,7 @@ std::string parityJson(const Parity& p) {
      <<",\"max_adamw_probe_rel_error\":"<<p.maxAdamRel
      <<",\"backend_counts\":{\"cpu\":"<<p.counts.cpu<<",\"opencl\":"<<p.counts.opencl
      <<",\"vulkan\":"<<p.counts.vulkan<<",\"other\":"<<p.counts.other
-     <<",\"callbacks\":"<<p.counts.callbacks<<"}}";
+     <<",\"callbacks\":"<<p.counts.callbacks<<"},\"error\":\""<<jsonEscape(p.error)<<"\"}";
     return o.str();
 }
 
@@ -459,6 +472,8 @@ struct Bench {
     double firstLoss=0,lastLoss=0,seconds=0,tokps=0;
     int steps=0,cpuOps=0,gpuOps=0,otherOps=0;
     std::string checkpointPath;
+    bool checkpointReloadOk=false;
+    std::string error;
 };
 
 Bench benchStatic(const Bundle& b,const std::string& baseModel,const std::string& workDir,
@@ -526,8 +541,36 @@ Bench benchStatic(const Bundle& b,const std::string& baseModel,const std::string
     req(mb.first&&mb.second>0,"getModelBuffer returned empty model");
     out.checkpointPath=workDir+"/gate-"+out.backend+".mnn";
     atomicWrite(out.checkpointPath,mb.first,mb.second);
+
+    // Prove the persisted checkpoint is structurally reloadable, not merely writable.
+    {
+        std::shared_ptr<Interpreter> reloaded(
+            Interpreter::createFromFile(out.checkpointPath.c_str()), Interpreter::destroy);
+        req(reloaded!=nullptr,"checkpoint reload Interpreter failed on "+out.backend);
+        auto* rs=reloaded->createSession(cfg);
+        req(rs!=nullptr,"checkpoint reload session failed on "+out.backend);
+        auto* rti=reloaded->getSessionInput(rs,"tokens");
+        auto* ryi=reloaded->getSessionInput(rs,"targets");
+        auto* rlo=reloaded->getSessionOutput(rs,"loss");
+        req(rti&&ryi&&rlo,"checkpoint reload IO contract failed on "+out.backend);
+        reloaded->releaseSession(rs);
+        out.checkpointReloadOk=true;
+    }
+
     net->releaseSession(session);
     return out;
+}
+
+Bench safeBenchStatic(const Bundle& b,const std::string& baseModel,const std::string& workDir,
+                     MNNForwardType type,int gpuMode,int steps) {
+    try {
+        return benchStatic(b,baseModel,workDir,type,gpuMode,steps);
+    } catch(const std::exception& e) {
+        Bench out;
+        out.backend=typeName(type);
+        out.error=e.what();
+        return out;
+    }
 }
 
 std::string benchJson(const Bench& b) {
@@ -537,7 +580,9 @@ std::string benchJson(const Bench& b) {
       <<",\"first_loss\":"<<b.firstLoss<<",\"last_loss\":"<<b.lastLoss
       <<",\"seconds\":"<<b.seconds<<",\"target_tokens_per_second\":"<<b.tokps
       <<",\"profile\":{\"cpu_backend_hits\":"<<b.cpuOps<<",\"gpu_backend_hits\":"<<b.gpuOps
-      <<",\"other_backend_hits\":"<<b.otherOps<<"},\"checkpoint\":\""<<jsonEscape(b.checkpointPath)<<"\"}";
+      <<",\"other_backend_hits\":"<<b.otherOps<<"},\"checkpoint\":\""<<jsonEscape(b.checkpointPath)<<"\""
+      <<",\"checkpoint_reload_ok\":"<<(b.checkpointReloadOk?"true":"false")
+      <<",\"error\":\""<<jsonEscape(b.error)<<"\"}";
     return o.str();
 }
 
@@ -640,8 +685,8 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         }
 
         // 2) Exact dynamic graph parity on GPU candidates.
-        Parity cl=dynamicParity(b,MNN_FORWARD_OPENCL,MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
-        Parity vk=dynamicParity(b,MNN_FORWARD_VULKAN,MNN_GPU_TUNING_WIDE);
+        Parity cl=safeDynamicParity(b,MNN_FORWARD_OPENCL,MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
+        Parity vk=safeDynamicParity(b,MNN_FORWARD_VULKAN,MNN_GPU_TUNING_WIDE);
 
         // 3) Serialize one backend-neutral static AdamW training loop and benchmark
         // independent fresh sessions. This avoids timing MNN's dynamic graph rebuild path.
@@ -649,12 +694,13 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         buildStaticAdamWModel(b,base);
         const int steps=20;
         Bench bc=benchStatic(b,base,workDir,MNN_FORWARD_CPU,0,steps);
+        req(bc.available&&bc.finite&&bc.checkpointReloadOk,"CPU static training/checkpoint reference failed");
         Bench bg;
-        if(cl.pass) bg=benchStatic(b,base,workDir,MNN_FORWARD_OPENCL,
-                                   MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
+        if(cl.pass) bg=safeBenchStatic(b,base,workDir,MNN_FORWARD_OPENCL,
+                                       MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
         else { bg.backend="OPENCL"; }
         Bench bv;
-        if(vk.pass) bv=benchStatic(b,base,workDir,MNN_FORWARD_VULKAN,MNN_GPU_TUNING_WIDE,steps);
+        if(vk.pass) bv=safeBenchStatic(b,base,workDir,MNN_FORWARD_VULKAN,MNN_GPU_TUNING_WIDE,steps);
         else { bv.backend="VULKAN"; }
 
         const double cpuT=bc.tokps;
@@ -663,10 +709,10 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
 
         // Acceptance is deliberately evidence-based, not "GPU did not crash".
         // 1.5x is reported as useful; 2x is the recommended canonical-switch threshold.
-        const bool clUseful=cl.pass&&bg.finite&&clRatio>=1.5;
-        const bool clCanonical=cl.pass&&bg.finite&&clRatio>=2.0;
-        const bool vkUseful=vk.pass&&bv.finite&&vkRatio>=1.5;
-        const bool vkCanonical=vk.pass&&bv.finite&&vkRatio>=2.0;
+        const bool clUseful=cl.pass&&bg.finite&&bg.checkpointReloadOk&&clRatio>=1.5;
+        const bool clCanonical=cl.pass&&bg.finite&&bg.checkpointReloadOk&&clRatio>=2.0;
+        const bool vkUseful=vk.pass&&bv.finite&&bv.checkpointReloadOk&&vkRatio>=1.5;
+        const bool vkCanonical=vk.pass&&bv.finite&&bv.checkpointReloadOk&&vkRatio>=2.0;
 
         std::string winner="CPU";
         double best=1.0;
