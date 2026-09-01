@@ -697,6 +697,17 @@ StaticParityResult staticParity(
     if(type==MNN_FORWARD_CPU) cfg.numThread=4;
     else cfg.mode=gpuMode;
 
+    // Variable::save() serializes tensor names but does NOT populate
+    // Net::outputName. MNN Session auto-detection therefore exposes only
+    // graph-leaf tensors as outputs. parity.global_grad_norm is intentionally
+    // consumed by the AdamW probe expressions, so it is not a leaf. The
+    // documented ScheduleConfig::saveTensors mechanism is exactly for this:
+    // retain named intermediates as session outputs. Keep this list compact so
+    // MNN may still reuse every other activation/gradient buffer.
+    cfg.saveTensors.push_back("parity.loss");
+    cfg.saveTensors.push_back("parity.global_grad_norm");
+    for(const auto& p:spec.probes) cfg.saveTensors.push_back(p.name);
+
     markStage(r.backend+":static_parity:create_session:start");
     auto* session=net->createSession(cfg);
     req(session!=nullptr,"static parity session failed on "+r.backend);
@@ -709,7 +720,30 @@ StaticParityResult staticParity(
     auto* yi=net->getSessionInput(session,"targets");
     auto* lo=net->getSessionOutput(session,"parity.loss");
     auto* gn=net->getSessionOutput(session,"parity.global_grad_norm");
-    req(ti&&yi&&lo&&gn,"static parity IO contract missing on "+r.backend);
+    if(!(ti&&yi&&lo&&gn)) {
+        std::ostringstream e;
+        e<<"static parity IO contract missing on "<<r.backend
+         <<": tokens="<<(ti?"yes":"NO")
+         <<", targets="<<(yi?"yes":"NO")
+         <<", loss="<<(lo?"yes":"NO")
+         <<", global_grad_norm="<<(gn?"yes":"NO")
+         <<"; inputs=[";
+        bool first=true;
+        for(const auto& kv:net->getSessionInputAll(session)) {
+            if(!first)e<<",";
+            first=false;
+            e<<kv.first;
+        }
+        e<<"]; outputs=[";
+        first=true;
+        for(const auto& kv:net->getSessionOutputAll(session)) {
+            if(!first)e<<",";
+            first=false;
+            e<<kv.first;
+        }
+        e<<"]";
+        throw std::runtime_error(e.str());
+    }
 
     {
         Tensor th(ti,Tensor::CAFFE);
