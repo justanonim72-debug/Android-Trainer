@@ -30,8 +30,8 @@ struct AdamConfig {
     double beta1 = 0.0;
     double beta2 = 0.0;
     double eps = 0.0;
-    double weightDecay = 0.0;
     double gateLr = 0.0;
+    std::map<std::string, double> slotWeightDecay;
 };
 
 struct ReferenceProbe {
@@ -51,6 +51,7 @@ public:
     std::string schema;
     std::string checkpointSha256;
     std::string trainBinSha256;
+    std::string modelStateSha256;
     std::string ropeStyle;
     int64_t parameterCount = 0;
     ModelConfig config;
