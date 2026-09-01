@@ -508,56 +508,160 @@ def verify_completed_boundary(project: Path, ckpt: Path, train_bin: Path, ck: di
     }
 
 
-def optimizer_semantics(model, ck: dict, origin: dict[str, str], gate_lr: float) -> dict:
+def optimizer_semantics(model, ck: dict, origin: dict[str, str], gate_lr: float, eng) -> dict:
     opt_state = ck.get("optimizer")
     if not isinstance(opt_state, dict) or not isinstance(opt_state.get("param_groups"), list):
         raise SystemExit("STOP: final checkpoint optimizer state missing")
     groups = opt_state["param_groups"]
-    if len(groups) != 1:
-        # Without saved parameter names, arbitrary multi-group state_dicts cannot
-        # be mapped back to model names safely. Fail instead of guessing.
-        names_present = all(isinstance(g.get("param_names"), list) for g in groups)
-        if not names_present:
-            raise SystemExit(
-                "STOP: checkpoint has multiple optimizer groups but no param_names; "
-                "exact per-parameter AdamW semantics cannot be proven without guessing"
-            )
+    if not groups:
+        raise SystemExit("STOP: final checkpoint optimizer has no parameter groups")
 
-    named = dict(model.named_parameters())
-    slot_wd = {}
-    slot_group = {}
+    named_items = list(model.named_parameters())
+    named = dict(named_items)
+    if set(origin.values()) != set(named):
+        raise SystemExit("STOP: normalized parameter mapping does not cover the exact trainable model")
 
     beta_eps = set()
-    for gi, g in enumerate(groups):
+    for g in groups:
         betas = tuple(float(x) for x in g.get("betas", (0.9, 0.999)))
         eps = float(g.get("eps", 1e-8))
         beta_eps.add((betas, eps))
-
     if len(beta_eps) != 1:
         raise SystemExit(f"STOP: per-group beta/eps differ: {beta_eps}")
     (betas, eps), = beta_eps
 
+    source_lrs = sorted({float(g.get("lr", 0.0)) for g in groups})
+    if len(source_lrs) != 1:
+        raise SystemExit(
+            "STOP: checkpoint optimizer groups have different learning rates; "
+            f"cannot define one exact fresh gate LR mapping: {source_lrs}"
+        )
+
+    slot_wd = {}
+    slot_group = {}
+    grouping_proof = None
+    source_weight_decay = None
+    group_param_counts = []
+
     if len(groups) == 1:
         wd = float(groups[0].get("weight_decay", 0.0))
+        got_ids = [int(x) for x in groups[0].get("params", [])]
+        if got_ids != list(range(len(named_items))):
+            raise SystemExit(
+                "STOP: single optimizer-group parameter IDs do not match the "
+                "complete model parameter order"
+            )
         for slot in origin:
             slot_wd[slot] = wd
             slot_group[slot] = 0
+        group_param_counts = [len(got_ids)]
+        grouping_proof = "single_group_complete_model"
+        source_weight_decay = wd
     else:
+        # The completed script-17 engine exposes optimizer_for(model, lr, weight_decay).
+        # Re-run THAT exact grouping function on this freshly loaded model instead of
+        # guessing names from opaque optimizer state_dict IDs.  PyTorch assigns those
+        # IDs in flattened optimizer-group order, not global model.named_parameters()
+        # order, so a naive integer->model-index mapping would be wrong.
+        factory = getattr(eng, "optimizer_for", None)
+        if not callable(factory):
+            raise SystemExit(
+                "STOP: multiple optimizer groups require the frozen engine's "
+                "optimizer_for() grouping function"
+            )
+
+        run_cfg = ck.get("run_config")
+        if not isinstance(run_cfg, dict) or "weight_decay" not in run_cfg:
+            raise SystemExit(
+                "STOP: checkpoint run_config.weight_decay missing; cannot "
+                "reconstruct the frozen optimizer grouping exactly"
+            )
+        source_weight_decay = float(run_cfg["weight_decay"])
+        if not math.isfinite(source_weight_decay) or source_weight_decay < 0:
+            raise SystemExit(
+                f"STOP: invalid checkpoint run_config.weight_decay={source_weight_decay}"
+            )
+
+        source_lr = source_lrs[0]
+        reconstructed = factory(model, source_lr, source_weight_decay)
+        recon_groups = reconstructed.param_groups
+        if len(recon_groups) != len(groups):
+            raise SystemExit(
+                "STOP: frozen engine optimizer_for() group count differs from "
+                f"checkpoint: engine={len(recon_groups)} checkpoint={len(groups)}"
+            )
+
+        name_by_obj = {id(p): name for name, p in named_items}
         by_name = {}
-        for gi, g in enumerate(groups):
-            wd = float(g.get("weight_decay", 0.0))
-            for name in g["param_names"]:
+        cursor = 0
+
+        for gi, (rg, cg) in enumerate(zip(recon_groups, groups)):
+            recon_names = []
+            for p in rg.get("params", []):
+                name = name_by_obj.get(id(p))
+                if name is None:
+                    raise SystemExit(
+                        f"STOP: engine optimizer group {gi} contains a parameter "
+                        "outside the exact model"
+                    )
+                recon_names.append(name)
+
+            got_ids = [int(x) for x in cg.get("params", [])]
+            expected_ids = list(range(cursor, cursor + len(recon_names)))
+            if got_ids != expected_ids:
+                raise SystemExit(
+                    "STOP: checkpoint optimizer parameter-ID packing differs from "
+                    f"the frozen engine grouping in group {gi}; "
+                    f"expected={expected_ids[:8]}... got={got_ids[:8]}..."
+                )
+            cursor += len(recon_names)
+            group_param_counts.append(len(recon_names))
+
+            recon_betas = tuple(float(x) for x in rg.get("betas", (0.9, 0.999)))
+            ck_betas = tuple(float(x) for x in cg.get("betas", (0.9, 0.999)))
+            recon_eps = float(rg.get("eps", 1e-8))
+            ck_eps = float(cg.get("eps", 1e-8))
+            recon_wd = float(rg.get("weight_decay", 0.0))
+            ck_wd = float(cg.get("weight_decay", 0.0))
+
+            if recon_betas != ck_betas or recon_eps != ck_eps or recon_wd != ck_wd:
+                raise SystemExit(
+                    "STOP: frozen engine optimizer semantics differ from checkpoint "
+                    f"in group {gi}: engine(betas={recon_betas},eps={recon_eps},wd={recon_wd}) "
+                    f"checkpoint(betas={ck_betas},eps={ck_eps},wd={ck_wd})"
+                )
+
+            for key in ("amsgrad", "maximize", "decoupled_weight_decay"):
+                if key in rg or key in cg:
+                    if rg.get(key) != cg.get(key):
+                        raise SystemExit(
+                            f"STOP: optimizer semantic flag {key} differs in group {gi}: "
+                            f"engine={rg.get(key)} checkpoint={cg.get(key)}"
+                        )
+
+            for name in recon_names:
                 if name in by_name:
-                    raise SystemExit(f"STOP: duplicate optimizer param_name: {name}")
-                by_name[name] = (gi, wd)
+                    raise SystemExit(f"STOP: parameter appears in multiple optimizer groups: {name}")
+                by_name[name] = (gi, ck_wd)
+
+        if cursor != len(named_items):
+            raise SystemExit(
+                "STOP: frozen engine optimizer grouping does not consume every "
+                f"trainable parameter: grouped={cursor} model={len(named_items)}"
+            )
+        if set(by_name) != set(named):
+            raise SystemExit(
+                "STOP: frozen engine optimizer grouping names do not exactly match "
+                "the trainable model"
+            )
+
         for slot, src in origin.items():
-            if src not in by_name:
-                raise SystemExit(f"STOP: optimizer param_names missing {src}")
             gi, wd = by_name[src]
             slot_group[slot] = int(gi)
             slot_wd[slot] = float(wd)
 
-    source_lrs = sorted({float(g.get("lr", 0.0)) for g in groups})
+        grouping_proof = "frozen_engine_optimizer_for+checkpoint_group_order"
+
     return {
         "gate_state": "fresh_zero_moments",
         "beta1": float(betas[0]),
@@ -566,6 +670,9 @@ def optimizer_semantics(model, ck: dict, origin: dict[str, str], gate_lr: float)
         "gate_lr": float(gate_lr),
         "source_optimizer_groups": len(groups),
         "source_checkpoint_lr_values": source_lrs,
+        "source_weight_decay": float(source_weight_decay),
+        "source_group_param_counts": group_param_counts,
+        "grouping_proof": grouping_proof,
         "slot_group": slot_group,
         "slot_weight_decay": slot_wd,
         "slot_source_name": dict(origin),
@@ -657,7 +764,7 @@ def main():
 
     norm, origin = exact_state(model)
     rope_style = detect_rope_style(engine_path.read_text(encoding="utf-8", errors="replace"))
-    hp = optimizer_semantics(model, ck, origin, args.gate_lr)
+    hp = optimizer_semantics(model, ck, origin, args.gate_lr, eng)
 
     raw = np.memmap(train_bin, dtype="<u2", mode="r")
     start = args.window_index * EXPECTED["seq_len"]
