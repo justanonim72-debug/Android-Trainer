@@ -117,6 +117,10 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/Android-Trainer-GPU-Gate-debug.apk
+          cp tools/export_model0001_bundle.py dist/export_model0001_bundle.py
+          cp tools/phone_export_bundle.sh dist/phone_export_bundle.sh
+          cp README.md dist/README.md
+          cp docs/GATE_SPEC.md dist/GATE_SPEC.md
           (
             cd dist
             sha256sum Android-Trainer-GPU-Gate-debug.apk > SHA256SUMS
@@ -136,6 +140,16 @@ jobs:
             "opencl":True,
             "vulkan_buffer":True,
             "mnn_build_train":True,
+            "frozen_model":{
+              "params":19145088,
+              "vocab":14000,
+              "context":256,
+              "cpt_v2_steps":15624,
+              "cpt_v2_stage_tokens":3999744,
+              "lifetime_tokens":5535744,
+              "final_model_state_sha256":"047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d",
+              "test_split_used":False,
+            },
           }
           p.write_text(json.dumps(data,indent=2)+"\n")
           PY
@@ -148,5 +162,9 @@ jobs:
             dist/Android-Trainer-GPU-Gate-debug.apk
             dist/SHA256SUMS
             dist/BUILD_MANIFEST.json
+            dist/export_model0001_bundle.py
+            dist/phone_export_bundle.sh
+            dist/README.md
+            dist/GATE_SPEC.md
           if-no-files-found: error
           retention-days: 14
