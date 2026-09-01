@@ -223,7 +223,7 @@ public final class MainActivity extends Activity {
                 String out = nativeRunGate(bundleDir.getAbsolutePath(), getFilesDir().getAbsolutePath(), thermal);
                 lastReport = out;
                 File report = new File(getFilesDir(), "last_gate_report.json");
-                try (OutputStream os = new FileOutputStream(report)) {
+                try (FileOutputStream os = new FileOutputStream(report)) {
                     os.write(out.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     os.getFD().sync();
                 }
