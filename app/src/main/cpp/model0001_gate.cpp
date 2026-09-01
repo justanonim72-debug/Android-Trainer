@@ -552,6 +552,315 @@ std::string parityJson(const Parity& p) {
     return o.str();
 }
 
+enum class StaticProbeKind { Logit, Gradient, AdamW };
+
+struct StaticProbeSpec {
+    std::string name;
+    StaticProbeKind kind;
+    std::string slot;
+    int index=0;
+    double ref=0.0;
+};
+
+struct StaticParityBuild {
+    std::string path;
+    std::vector<StaticProbeSpec> probes;
+};
+
+VARP scalarProbe(VARP x,int index,const std::string& name) {
+    auto flat=_Reshape(x,{-1});
+    auto v=_Gather(flat,_Scalar<int32_t>(index));
+    v->setName(name);
+    return v;
+}
+
+StaticParityBuild buildStaticParityModel(const Bundle& b,const std::string& path) {
+    // Build the exact one-step verification graph on CPU, then serialize it.
+    // Only compact outputs are retained: loss, global grad norm, selected
+    // logits, selected gradients, and selected fresh-state AdamW values.
+    // This preserves the same scientific checks as dynamic parity without
+    // host-mapping all 19M gradient elements on OpenCL.
+    auto exe=makeExecutor(MNN_FORWARD_CPU,4,0);
+    ExecutorScope scope(exe);
+
+    auto g=buildGraph(b);
+    auto gm=gradients(g);
+    auto upd=oneStepExpressions(g,gm,b);
+
+    g.loss->setName("parity.loss");
+    upd.norm->setName("parity.global_grad_norm");
+
+    std::vector<VARP> outputs={g.loss,upd.norm};
+    StaticParityBuild out;
+    out.path=path;
+
+    int serial=0;
+    const auto& logitProbes=b.manifest["reference"]["logit_probe"];
+    for(const auto& q:logitProbes.GetArray()) {
+        const int pos=q["position"].GetInt();
+        const int tok=q["token"].GetInt();
+        const int index=pos*V+tok;
+        const std::string name="parity.logit."+std::to_string(serial++);
+        outputs.push_back(scalarProbe(g.logits,index,name));
+        out.probes.push_back({name,StaticProbeKind::Logit,"logits",index,q["value"].GetDouble()});
+    }
+
+    serial=0;
+    for(const auto& pk:g.params) {
+        const auto& rg=refGradient(b,pk.first);
+        const auto& inds=rg["probe_indices"];
+        const auto& vals=rg["probe_values"];
+        auto grad=gm.at(pk.second);
+        for(rapidjson::SizeType i=0;i<inds.Size();++i) {
+            const int index=inds[i].GetInt();
+            const std::string name="parity.grad."+std::to_string(serial++);
+            outputs.push_back(scalarProbe(grad,index,name));
+            out.probes.push_back({name,StaticProbeKind::Gradient,pk.first,index,vals[i].GetDouble()});
+        }
+    }
+
+    serial=0;
+    for(const auto& pk:g.params) {
+        const auto& ra=refAdam(b,pk.first);
+        const auto& inds=ra["probe_indices"];
+        const auto& vals=ra["after"];
+        auto pnew=upd.pnew.at(pk.first);
+        for(rapidjson::SizeType i=0;i<inds.Size();++i) {
+            const int index=inds[i].GetInt();
+            const std::string name="parity.adam."+std::to_string(serial++);
+            outputs.push_back(scalarProbe(pnew,index,name));
+            out.probes.push_back({name,StaticProbeKind::AdamW,pk.first,index,vals[i].GetDouble()});
+        }
+    }
+
+    markStage("static_parity:serialize:start");
+    Variable::save(outputs,path.c_str());
+    markStage("static_parity:serialize:done");
+
+    std::ifstream fs(path,std::ios::binary|std::ios::ate);
+    req(fs&&fs.tellg()>0,"static parity model serialization failed");
+    return out;
+}
+
+struct StaticParityResult {
+    std::string backend;
+    bool available=false;
+    bool finite=false;
+    bool pass=false;
+    double loss=0.0;
+    double lossAbs=0.0;
+    double gradNorm=0.0;
+    double gradNormRel=0.0;
+    double maxLogitAbs=0.0;
+    double maxGradAbs=0.0;
+    double maxGradRel=0.0;
+    double maxAdamAbs=0.0;
+    double maxAdamRel=0.0;
+    std::string worstGradSlot;
+    std::string worstAdamSlot;
+    int worstGradIndex=-1;
+    int worstAdamIndex=-1;
+    double worstGradRef=0.0;
+    double worstGradGot=0.0;
+    double worstAdamRef=0.0;
+    double worstAdamGot=0.0;
+    double sessionMemoryMb=0.0;
+    BackendCounts counts;
+    std::string error;
+};
+
+StaticParityResult staticParity(
+    const Bundle& b,
+    const StaticParityBuild& spec,
+    MNNForwardType type,
+    int gpuMode
+) {
+    StaticParityResult r;
+    r.backend=typeName(type);
+
+    markStage(r.backend+":static_parity:interpreter:start");
+    std::shared_ptr<Interpreter> net(
+        Interpreter::createFromFile(spec.path.c_str()),Interpreter::destroy);
+    req(net!=nullptr,"static parity Interpreter failed on "+r.backend);
+    markStage(r.backend+":static_parity:interpreter:done");
+
+    BackendConfig bc;
+    bc.precision=BackendConfig::Precision_High;
+    bc.power=BackendConfig::Power_High;
+    bc.memory=(type==MNN_FORWARD_OPENCL)
+        ? BackendConfig::Memory_Low
+        : BackendConfig::Memory_Normal;
+
+    ScheduleConfig cfg;
+    cfg.type=type;
+    cfg.backendConfig=&bc;
+    if(type==MNN_FORWARD_CPU) cfg.numThread=4;
+    else cfg.mode=gpuMode;
+
+    markStage(r.backend+":static_parity:create_session:start");
+    auto* session=net->createSession(cfg);
+    req(session!=nullptr,"static parity session failed on "+r.backend);
+    markStage(r.backend+":static_parity:create_session:done");
+    r.available=true;
+
+    net->getSessionInfo(session,MNN::Interpreter::MEMORY,&r.sessionMemoryMb);
+
+    auto* ti=net->getSessionInput(session,"tokens");
+    auto* yi=net->getSessionInput(session,"targets");
+    auto* lo=net->getSessionOutput(session,"parity.loss");
+    auto* gn=net->getSessionOutput(session,"parity.global_grad_norm");
+    req(ti&&yi&&lo&&gn,"static parity IO contract missing on "+r.backend);
+
+    {
+        Tensor th(ti,Tensor::CAFFE);
+        Tensor yh(yi,Tensor::CAFFE);
+        auto* p=th.host<int32_t>();
+        auto* q=yh.host<int32_t>();
+        req(p&&q,"static parity host input allocation failed");
+        for(int i=0;i<S;++i){p[i]=b.sampleTokens[i];q[i]=b.sampleTokens[i+1];}
+        ti->copyFromHostTensor(&th);
+        yi->copyFromHostTensor(&yh);
+    }
+
+    // No more session creation/resizing is needed for this read-only parity
+    // model. MNN documents releaseModel() specifically to drop the interpreter
+    // model buffer after session creation and save roughly the model-file size.
+    net->releaseModel();
+
+    auto before=[](const std::vector<Tensor*>&,const OperatorInfo*){return true;};
+    auto after=[&](const std::vector<Tensor*>& ts,const OperatorInfo*) {
+        std::set<int> types;
+        for(auto* t:ts) {
+            auto* bn=t?net->getBackend(session,t):nullptr;
+            if(bn) types.insert(static_cast<int>(bn->type()));
+        }
+        for(int x:types) {
+            if(x==MNN_FORWARD_CPU) r.counts.cpu++;
+            else if(x==MNN_FORWARD_OPENCL) r.counts.opencl++;
+            else if(x==MNN_FORWARD_VULKAN) r.counts.vulkan++;
+            else r.counts.other++;
+        }
+        r.counts.callbacks++;
+        return true;
+    };
+
+    markStage(r.backend+":static_parity:run:start");
+    auto ec=net->runSessionWithCallBackInfo(session,before,after,true);
+    req(ec==NO_ERROR,"static parity run failed on "+r.backend);
+    markStage(r.backend+":static_parity:run:done");
+
+    auto readScalar=[&](Tensor* t,const std::string& label)->double {
+        req(t!=nullptr,"static parity output missing: "+label);
+        Tensor host(t,Tensor::CAFFE);
+        t->copyToHostTensor(&host);
+        auto* p=host.host<float>();
+        req(p!=nullptr,"static parity host read failed: "+label);
+        return static_cast<double>(p[0]);
+    };
+
+    markStage(r.backend+":static_parity:small_outputs:start");
+    r.loss=readScalar(lo,"loss");
+    r.gradNorm=readScalar(gn,"global_grad_norm");
+    r.lossAbs=std::abs(r.loss-b.reference.loss);
+    r.gradNormRel=relerr(r.gradNorm,b.reference.globalGradNorm);
+
+    for(const auto& p:spec.probes) {
+        auto* t=net->getSessionOutput(session,p.name.c_str());
+        const double got=readScalar(t,p.name);
+        const double ae=std::abs(got-p.ref);
+        const double re=relerr(got,p.ref);
+        switch(p.kind) {
+            case StaticProbeKind::Logit:
+                r.maxLogitAbs=std::max(r.maxLogitAbs,ae);
+                break;
+            case StaticProbeKind::Gradient:
+                if(ae>r.maxGradAbs) {
+                    r.maxGradAbs=ae;
+                    r.worstGradSlot=p.slot;
+                    r.worstGradIndex=p.index;
+                    r.worstGradRef=p.ref;
+                    r.worstGradGot=got;
+                }
+                r.maxGradRel=std::max(r.maxGradRel,re);
+                break;
+            case StaticProbeKind::AdamW:
+                if(ae>r.maxAdamAbs) {
+                    r.maxAdamAbs=ae;
+                    r.worstAdamSlot=p.slot;
+                    r.worstAdamIndex=p.index;
+                    r.worstAdamRef=p.ref;
+                    r.worstAdamGot=got;
+                }
+                r.maxAdamRel=std::max(r.maxAdamRel,re);
+                break;
+        }
+    }
+    markStage(r.backend+":static_parity:small_outputs:done");
+
+    r.finite=
+        std::isfinite(r.loss)&&std::isfinite(r.gradNorm)&&
+        std::isfinite(r.maxLogitAbs)&&std::isfinite(r.maxGradAbs)&&
+        std::isfinite(r.maxAdamAbs);
+
+    const bool backendOk=(type!=MNN_FORWARD_OPENCL)||r.counts.opencl>0;
+    r.pass=
+        r.finite&&backendOk&&
+        r.lossAbs<=2e-3&&
+        r.maxLogitAbs<=5e-3&&
+        r.gradNormRel<=2e-2&&
+        r.maxGradAbs<=5e-3&&
+        r.maxAdamAbs<=5e-4;
+
+    net->releaseSession(session);
+    return r;
+}
+
+StaticParityResult safeStaticParity(
+    const Bundle& b,
+    const StaticParityBuild& spec,
+    MNNForwardType type,
+    int gpuMode
+) {
+    try {
+        return staticParity(b,spec,type,gpuMode);
+    } catch(const std::exception& e) {
+        StaticParityResult r;
+        r.backend=typeName(type);
+        r.error=e.what();
+        return r;
+    }
+}
+
+std::string staticParityJson(const StaticParityResult& r) {
+    std::ostringstream o;
+    o<<"{\"backend\":\""<<r.backend<<"\",\"available\":"<<(r.available?"true":"false")
+     <<",\"finite\":"<<(r.finite?"true":"false")
+     <<",\"pass\":"<<(r.pass?"true":"false")
+     <<",\"session_memory_mb\":"<<r.sessionMemoryMb
+     <<",\"loss\":"<<r.loss
+     <<",\"loss_abs_error\":"<<r.lossAbs
+     <<",\"global_grad_norm\":"<<r.gradNorm
+     <<",\"grad_norm_rel_error\":"<<r.gradNormRel
+     <<",\"max_logit_abs_error\":"<<r.maxLogitAbs
+     <<",\"max_grad_probe_abs_error\":"<<r.maxGradAbs
+     <<",\"max_grad_probe_rel_error\":"<<r.maxGradRel
+     <<",\"max_adamw_probe_abs_error\":"<<r.maxAdamAbs
+     <<",\"max_adamw_probe_rel_error\":"<<r.maxAdamRel
+     <<",\"worst_grad\":{\"slot\":\""<<jsonEscape(r.worstGradSlot)
+     <<"\",\"index\":"<<r.worstGradIndex
+     <<",\"ref\":"<<r.worstGradRef<<",\"got\":"<<r.worstGradGot<<"}"
+     <<",\"worst_adamw\":{\"slot\":\""<<jsonEscape(r.worstAdamSlot)
+     <<"\",\"index\":"<<r.worstAdamIndex
+     <<",\"ref\":"<<r.worstAdamRef<<",\"got\":"<<r.worstAdamGot<<"}"
+     <<",\"backend_counts\":{\"cpu\":"<<r.counts.cpu
+     <<",\"opencl\":"<<r.counts.opencl
+     <<",\"vulkan\":"<<r.counts.vulkan
+     <<",\"other\":"<<r.counts.other
+     <<",\"callbacks\":"<<r.counts.callbacks<<"}"
+     <<",\"error\":\""<<jsonEscape(r.error)<<"\"}";
+    return o.str();
+}
+
 struct StaticBuild {
     std::string path;
 };
@@ -623,8 +932,10 @@ Bench benchStatic(const Bundle& b,const std::string& baseModel,const std::string
     std::shared_ptr<Interpreter> net(Interpreter::createFromFile(baseModel.c_str()),Interpreter::destroy);
     if(!net) return out;
     BackendConfig bc; bc.precision=BackendConfig::Precision_High; bc.power=BackendConfig::Power_High;
-    ScheduleConfig cfg; cfg.type=type; cfg.numThread=(type==MNN_FORWARD_CPU)?4:1; cfg.backendConfig=&bc;
-    cfg.mode=(type==MNN_FORWARD_OPENCL)?gpuMode:0;
+    bc.memory=(type==MNN_FORWARD_OPENCL)?BackendConfig::Memory_Low:BackendConfig::Memory_Normal;
+    ScheduleConfig cfg; cfg.type=type; cfg.backendConfig=&bc;
+    if(type==MNN_FORWARD_CPU) cfg.numThread=4;
+    else cfg.mode=gpuMode;
     auto* session=net->createSession(cfg);
     if(!session) return out;
     out.available=true;
