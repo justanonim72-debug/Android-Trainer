@@ -831,6 +831,7 @@ StaticParityResult staticParity(
     }
     markStage(r.backend+":static_parity:small_outputs:done");
 
+    markStage(r.backend+":static_parity:post_checks:start");
     r.finite=
         std::isfinite(r.loss)&&std::isfinite(r.gradNorm)&&
         std::isfinite(r.maxLogitAbs)&&std::isfinite(r.maxGradAbs)&&
@@ -844,8 +845,54 @@ StaticParityResult staticParity(
         r.gradNormRel<=2e-2&&
         r.maxGradAbs<=5e-3&&
         r.maxAdamAbs<=5e-4;
+    markStage(r.backend+":static_parity:post_checks:done");
 
-    net->releaseSession(session);
+    // Preserve the computed parity evidence BEFORE touching Session teardown.
+    // This file is diagnostic-only and lets the next process distinguish
+    // "GPU math completed" from "GPU resource destruction completed".
+    try {
+        std::ostringstream d;
+        d<<"backend="<<r.backend<<"\n"
+         <<"available="<<(r.available?1:0)<<"\n"
+         <<"finite="<<(r.finite?1:0)<<"\n"
+         <<"pass="<<(r.pass?1:0)<<"\n"
+         <<"loss="<<r.loss<<"\n"
+         <<"loss_abs_error="<<r.lossAbs<<"\n"
+         <<"global_grad_norm="<<r.gradNorm<<"\n"
+         <<"grad_norm_rel_error="<<r.gradNormRel<<"\n"
+         <<"max_logit_abs_error="<<r.maxLogitAbs<<"\n"
+         <<"max_grad_probe_abs_error="<<r.maxGradAbs<<"\n"
+         <<"max_adamw_probe_abs_error="<<r.maxAdamAbs<<"\n"
+         <<"backend_cpu_hits="<<r.counts.cpu<<"\n"
+         <<"backend_opencl_hits="<<r.counts.opencl<<"\n"
+         <<"backend_vulkan_hits="<<r.counts.vulkan<<"\n"
+         <<"callbacks="<<r.counts.callbacks<<"\n";
+        const auto slash=gStagePath.find_last_of('/');
+        if(slash!=std::string::npos) {
+            const std::string path=
+                gStagePath.substr(0,slash+1)+"last_static_parity_pre_teardown.txt";
+            const auto text=d.str();
+            atomicWrite(path,text.data(),text.size());
+        }
+    } catch (...) {
+        // Forensics must never change gate behavior.
+    }
+    markStage(r.backend+":static_parity:pre_teardown_snapshot:done");
+
+    markStage(r.backend+":static_parity:release_session:start");
+    const bool released=net->releaseSession(session);
+    markStage(
+        r.backend+
+        (released?":static_parity:release_session:done":
+                  ":static_parity:release_session:returned_false"));
+    req(released,"static parity releaseSession failed on "+r.backend);
+
+    // Interpreter destruction would normally happen at function exit. Make it
+    // explicit solely to place an exact breadcrumb on the second teardown
+    // boundary; this does not alter backend/model/session configuration.
+    markStage(r.backend+":static_parity:interpreter_destroy:start");
+    net.reset();
+    markStage(r.backend+":static_parity:interpreter_destroy:done");
     return r;
 }
 
