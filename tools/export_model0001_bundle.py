@@ -570,16 +570,18 @@ def optimizer_semantics(model, ck: dict, origin: dict[str, str], gate_lr: float,
                 "optimizer_for() grouping function"
             )
 
-        run_cfg = ck.get("run_config")
-        if not isinstance(run_cfg, dict) or "weight_decay" not in run_cfg:
-            raise SystemExit(
-                "STOP: checkpoint run_config.weight_decay missing; cannot "
-                "reconstruct the frozen optimizer grouping exactly"
-            )
-        source_weight_decay = float(run_cfg["weight_decay"])
+        # The checkpoint itself records the exact per-group weight decay values.
+        # For the frozen script-17 optimizer_for(), group 0 is the decay bucket
+        # and group 1 is the no-decay bucket.  Use checkpoint group 0's value as
+        # the reconstruction input, then verify EVERY reconstructed group back
+        # against the checkpoint (count/order/IDs/betas/eps/WD/semantic flags).
+        # This avoids depending on optional run_config metadata that CPT-v2 may
+        # legitimately omit.
+        source_weight_decay = float(groups[0].get("weight_decay", float("nan")))
         if not math.isfinite(source_weight_decay) or source_weight_decay < 0:
             raise SystemExit(
-                f"STOP: invalid checkpoint run_config.weight_decay={source_weight_decay}"
+                "STOP: checkpoint optimizer group 0 has invalid weight_decay="
+                f"{source_weight_decay}"
             )
 
         source_lr = source_lrs[0]
