@@ -307,19 +307,89 @@ def discover_checkpoint(project: Path, explicit: str | None, eng) -> Path:
             if not isinstance(state, dict):
                 continue
             sha = engine_state_hash(eng, state)
-            inspected.append((str(p), sha))
+            step = _first_int(ck, ["stage_step", "stage_steps", "step", "optimizer_step"])
+            stage_tok = _first_int(ck, ["stage_tokens_seen", "stage_tokens", "stage_scored_train_tokens"])
+            life_tok = _first_int(ck, ["lifetime_tokens_seen", "lifetime_tokens", "cumulative_tokens_seen"])
+            opt = ck.get("optimizer")
+            has_optimizer = isinstance(opt, dict) and isinstance(opt.get("param_groups"), list) and len(opt["param_groups"]) > 0
+            rec = {
+                "path": p,
+                "model_sha": sha,
+                "step": step,
+                "stage_tokens": stage_tok,
+                "lifetime_tokens": life_tok,
+                "has_optimizer": has_optimizer,
+                "is_latest": p.name == "latest.pt",
+                "looks_cpt_v2": "cpt_v2" in str(p).lower(),
+            }
+            inspected.append(rec)
             if sha == EXPECTED_STAGE["final_model_state_sha256"]:
-                matches.append(p)
-        except Exception:
-            continue
+                matches.append(rec)
+        except Exception as e:
+            inspected.append({"path": p, "error": type(e).__name__})
 
-    if len(matches) != 1:
-        detail = "\n".join(f"  {p}  model_sha={s}" for p, s in inspected[-12:])
-        raise SystemExit(
-            "STOP: could not uniquely locate the completed CPT-v2 model by exact model-state SHA. "
-            f"matches={len(matches)}\n{detail}"
+    # It is normal for a completed run to contain both latest.pt and final_model.pt
+    # with the SAME final model-state hash. The gate needs optimizer metadata, so
+    # select the unique checkpoint that can prove the completed stage semantics.
+    eligible = []
+    for rec in matches:
+        if not rec["has_optimizer"]:
+            continue
+        if rec["step"] is not None and rec["step"] != EXPECTED_STAGE["stage_steps"]:
+            continue
+        if rec["stage_tokens"] is not None and rec["stage_tokens"] != EXPECTED_STAGE["stage_tokens_seen"]:
+            continue
+        if rec["lifetime_tokens"] is not None and rec["lifetime_tokens"] != EXPECTED_STAGE["lifetime_tokens_seen"]:
+            continue
+        eligible.append(rec)
+
+    # Prefer the canonical resumable latest.pt from the CPT-v2 run. This is not a
+    # guess: final_model.pt may intentionally duplicate weights while omitting
+    # optimizer/RNG state, whereas latest.pt is the full stage-boundary checkpoint.
+    ranked = sorted(
+        eligible,
+        key=lambda r: (
+            1 if r["is_latest"] else 0,
+            1 if r["looks_cpt_v2"] else 0,
+            1 if r["step"] == EXPECTED_STAGE["stage_steps"] else 0,
+            1 if r["stage_tokens"] == EXPECTED_STAGE["stage_tokens_seen"] else 0,
+            1 if r["lifetime_tokens"] == EXPECTED_STAGE["lifetime_tokens_seen"] else 0,
+        ),
+        reverse=True,
+    )
+
+    if ranked:
+        best_key = (
+            ranked[0]["is_latest"],
+            ranked[0]["looks_cpt_v2"],
+            ranked[0]["step"] == EXPECTED_STAGE["stage_steps"],
+            ranked[0]["stage_tokens"] == EXPECTED_STAGE["stage_tokens_seen"],
+            ranked[0]["lifetime_tokens"] == EXPECTED_STAGE["lifetime_tokens_seen"],
         )
-    return matches[0]
+        tied = [
+            r for r in ranked
+            if (
+                r["is_latest"],
+                r["looks_cpt_v2"],
+                r["step"] == EXPECTED_STAGE["stage_steps"],
+                r["stage_tokens"] == EXPECTED_STAGE["stage_tokens_seen"],
+                r["lifetime_tokens"] == EXPECTED_STAGE["lifetime_tokens_seen"],
+            ) == best_key
+        ]
+        if len(tied) == 1:
+            return tied[0]["path"]
+
+    detail = "\n".join(
+        "  " + str(r.get("path")) +
+        (f" model_sha={r.get('model_sha')} optimizer={r.get('has_optimizer')} "
+         f"step={r.get('step')} stage_tok={r.get('stage_tokens')} life_tok={r.get('lifetime_tokens')}"
+         if "model_sha" in r else f" error={r.get('error')}")
+        for r in inspected[-20:]
+    )
+    raise SystemExit(
+        "STOP: could not uniquely identify the full completed CPT-v2 checkpoint. "
+        f"model_matches={len(matches)} eligible_full_checkpoints={len(eligible)}\n{detail}"
+    )
 
 
 def discover_completed_marker(ckpt: Path) -> tuple[Path | None, dict | None]:
