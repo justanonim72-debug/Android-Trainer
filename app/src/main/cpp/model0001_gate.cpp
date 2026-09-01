@@ -40,6 +40,17 @@ using namespace MNN::Express;
 namespace at {
 namespace {
 
+thread_local std::string gStagePath;
+
+void markStage(const std::string& stage) {
+    if (gStagePath.empty()) return;
+    try {
+        atomicWrite(gStagePath, stage.data(), stage.size());
+    } catch (...) {
+        // Crash diagnostics must never alter gate behavior.
+    }
+}
+
 constexpr int S = 256;
 constexpr int V = 14000;
 constexpr int D = 384;
@@ -294,6 +305,7 @@ void requireCompleteGradients(const Graph& g,const std::map<VARP,VARP>& gm,const
 
 std::map<VARP,VARP> gradients(Graph& g) {
     OpGrad::init();
+    markStage("gradients:enter");
 
     // Do not differentiate the numerically-stable logsumexp loss expression
     // through MNN 3.6.1. Its ReduceMaxGrad normalizes the max mask with a
@@ -325,7 +337,9 @@ std::map<VARP,VARP> gradients(Graph& g) {
     for(const auto& kv:g.params) targets.push_back(kv.second);
     targets.push_back(g.embeddingLookup);
 
+    markStage("gradients:gradLinear:start");
     auto grads=OpGrad::gradLinear(g.logits,targets,{dlogits},{"embedding_lookup"});
+    markStage("gradients:gradLinear:done");
     req(grads.size()==targets.size(),"dynamic parity: MNN gradLinear size mismatch");
 
     std::map<VARP,VARP> m;
@@ -344,15 +358,18 @@ std::map<VARP,VARP> gradients(Graph& g) {
     auto tokenIndex=_Reshape(g.tokenInput,{S,1});
     int32_t embShapeData[2]={V,D};
     auto embShape=_Const(embShapeData,{2},NHWC,halide_type_of<int32_t>());
+    markStage("gradients:scatter_add:build:start");
     auto lookupWeightGrad=_ScatterNd(
         tokenIndex,
         lookupGrad,
         embShape,
         MNN::BinaryOpOperation_ADD
     );
+    markStage("gradients:scatter_add:build:done");
     directIt->second=directIt->second+lookupWeightGrad;
 
     requireCompleteGradients(g,m,"dynamic parity");
+    markStage("gradients:return");
     return m;
 }
 
@@ -420,20 +437,34 @@ UpdateExpressions oneStepExpressions(Graph& g,const std::map<VARP,VARP>& gm,cons
 
 Parity dynamicParity(const Bundle& b,MNNForwardType type,int gpuMode) {
     Parity p; p.backend=typeName(type);
+    markStage(p.backend + ":dynamic:enter");
     auto exe=makeExecutor(type,4,gpuMode);
     req(exe!=nullptr,"cannot create "+p.backend+" executor");
     ExecutorScope scope(exe);
     installProfiler(exe,&p.counts);
+    markStage(p.backend + ":dynamic:build_graph:start");
     auto g=buildGraph(b); feedGraph(g,b);
-    auto gm=gradients(g);
-    auto upd=oneStepExpressions(g,gm,b);
+    markStage(p.backend + ":dynamic:build_graph:done");
 
+    markStage(p.backend + ":dynamic:gradients:start");
+    auto gm=gradients(g);
+    markStage(p.backend + ":dynamic:gradients:done");
+
+    auto upd=oneStepExpressions(g,gm,b);
+    markStage(p.backend + ":dynamic:updates_built");
+
+    markStage(p.backend + ":dynamic:loss_read:start");
     const float* lp=g.loss->readMap<float>(); req(lp,"loss readMap failed");
+    markStage(p.backend + ":dynamic:loss_read:done");
     p.loss=lp[0]; p.lossAbs=std::abs(p.loss-b.reference.loss);
+    markStage(p.backend + ":dynamic:gradnorm:start");
     p.gradNorm=hostGlobalNorm(gm);
+    markStage(p.backend + ":dynamic:gradnorm:done");
     p.gradNormRel=relerr(p.gradNorm,b.reference.globalGradNorm);
 
+    markStage(p.backend + ":dynamic:logits_read:start");
     const float* logits=g.logits->readMap<float>(); req(logits,"logits readMap failed");
+    markStage(p.backend + ":dynamic:logits_read:done");
     const auto& probes=b.manifest["reference"]["logit_probe"];
     for(const auto& q:probes.GetArray()) {
         int pos=q["position"].GetInt(), tok=q["token"].GetInt();
@@ -481,6 +512,7 @@ Parity dynamicParity(const Bundle& b,MNNForwardType type,int gpuMode) {
 
     // CPU parity is intentionally strict; GPU still must remain close enough to
     // the PyTorch FP32 reference to be scientifically interchangeable at a stage boundary.
+    markStage(p.backend + ":dynamic:probe_reads:done");
     p.pass=std::isfinite(p.loss)&&std::isfinite(p.gradNorm)
         && p.lossAbs<=2e-3 && p.maxLogitAbs<=5e-3
         && p.gradNormRel<=2e-2 && p.maxGradProbeAbs<=5e-3
@@ -739,8 +771,10 @@ std::string probeBackendsJson() {
          <<"\",\"opencl\":"<<openClProbe()
          <<",\"executors\":{\"cpu\":"<<(cpu?"true":"false")
          <<",\"opencl\":"<<(cl?"true":"false")<<",\"vulkan_buffer\":"<<(vk?"true":"false")<<"}}";
+        markStage("run:success");
         return o.str();
     } catch(const std::exception& e) {
+        markStage(std::string("run:exception:")+e.what());
         return std::string("{\"status\":\"FAIL\",\"error\":\"")+jsonEscape(e.what())+"\"}";
     }
 }
@@ -759,8 +793,11 @@ std::string validateBundleJson(const std::string& dir) {
 }
 
 std::string runModel0001GateJson(const std::string& dir,const std::string& workDir,float thermalHeadroom) {
+    gStagePath=workDir+"/last_native_stage.txt";
+    markStage("run:enter");
     try {
         auto b=Bundle::load(dir);
+        markStage("run:bundle_loaded");
 
         // 1) Reference parity on MNN CPU. If the Python source did not expose
         // the RoPE layout clearly, empirically select between the two standard
@@ -786,7 +823,9 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
             }
         } else {
             ropeEvidence = "declared->" + b.ropeStyle;
+            markStage("run:cpu_parity:start");
             cpu = dynamicParity(b,MNN_FORWARD_CPU,0);
+            markStage("run:cpu_parity:done");
         }
         if(!cpu.pass) {
             return std::string("{\"status\":\"FAIL_CPU_PARITY\",\"thermal_headroom_start\":")+
@@ -796,19 +835,29 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         // 2) Exact dynamic graph parity on the approved GPU candidate.
         // Project policy keeps Vulkan out of training; OpenCL is the only GPU
         // backend evaluated for migration.
+        markStage("run:opencl_parity:start");
         Parity cl=safeDynamicParity(b,MNN_FORWARD_OPENCL,MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
+        markStage("run:opencl_parity:done");
         Parity vk; vk.backend="VULKAN"; vk.pass=false; vk.error="disabled_by_project_policy";
 
         // 3) Serialize one backend-neutral static AdamW training loop and benchmark
         // independent fresh sessions. This avoids timing MNN's dynamic graph rebuild path.
         const std::string base=workDir+"/model0001-gate-static-base.mnn";
+        markStage("run:static_build:start");
         buildStaticAdamWModel(b,base);
+        markStage("run:static_build:done");
         const int steps=20;
+        markStage("run:cpu_static:start");
         Bench bc=benchStatic(b,base,workDir,MNN_FORWARD_CPU,0,steps);
+        markStage("run:cpu_static:done");
         req(bc.available&&bc.finite&&bc.checkpointReloadOk,"CPU static training/checkpoint reference failed");
         Bench bg;
-        if(cl.pass) bg=safeBenchStatic(b,base,workDir,MNN_FORWARD_OPENCL,
-                                       MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
+        if(cl.pass) {
+            markStage("run:opencl_static:start");
+            bg=safeBenchStatic(b,base,workDir,MNN_FORWARD_OPENCL,
+                               MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
+            markStage("run:opencl_static:done");
+        }
         else { bg.backend="OPENCL"; }
         Bench bv;
         bv.backend="VULKAN";
