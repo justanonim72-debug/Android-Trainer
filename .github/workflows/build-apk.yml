@@ -1,0 +1,151 @@
+name: build-android-gpu-gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [gpu-gate-v1]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  MNN_COMMIT: d407447ed56c4121a11ccbd266dc184ca1ead0c2
+  ANDROID_NDK_VERSION: 27.2.12479018
+  ANDROID_COMPILE_SDK: "35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Android-Trainer
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned MNN 3.6.1
+        uses: actions/checkout@v4
+        with:
+          repository: alibaba/MNN
+          ref: ${{ env.MNN_COMMIT }}
+          path: vendor/MNN
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify MNN pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C vendor/MNN rev-parse HEAD)" = "$MNN_COMMIT"
+          grep -q 'option(MNN_BUILD_TRAIN' vendor/MNN/CMakeLists.txt
+          grep -q 'add_library(MNNTrain SHARED' vendor/MNN/tools/train/CMakeLists.txt
+          grep -q 'MNN_OPENCL' vendor/MNN/CMakeLists.txt
+          grep -q 'MNN_VULKAN_IMAGE' vendor/MNN/source/backend/vulkan/CMakeLists.txt
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install pinned Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager             "platforms;android-${ANDROID_COMPILE_SDK}"             "build-tools;${ANDROID_BUILD_TOOLS}"             "ndk;${ANDROID_NDK_VERSION}"             "cmake;${CMAKE_VERSION}"
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Python exporter syntax check
+        run: python3 -m py_compile tools/export_model0001_bundle.py
+
+      - name: Guard public repository against local model data
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find . -path ./vendor -prune -o -type f \( -name '*.pt' -o -name '*.atb' -o -name '*.bin' -o -name '*.mnn' \) -print | grep -q .; then
+            echo "Refusing to publish checkpoint/dataset/model binary in source tree"
+            find . -path ./vendor -prune -o -type f \( -name '*.pt' -o -name '*.atb' -o -name '*.bin' -o -name '*.mnn' \) -print
+            exit 1
+          fi
+
+      - name: Build arm64-v8a debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Verify APK and native ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" verify "$APK"
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/zipalign" -c -P 16 4 "$APK"
+
+          rm -rf build/apkcheck
+          mkdir -p build/apkcheck
+          unzip -q "$APK" 'lib/arm64-v8a/*.so' -d build/apkcheck
+
+          test -s build/apkcheck/lib/arm64-v8a/libandroid_trainer.so
+          test -s build/apkcheck/lib/arm64-v8a/libMNN.so
+          test -s build/apkcheck/lib/arm64-v8a/libMNN_Express.so
+          test -s build/apkcheck/lib/arm64-v8a/libMNNTrain.so
+          test -s build/apkcheck/lib/arm64-v8a/libMNN_CL.so
+          test -s build/apkcheck/lib/arm64-v8a/libMNN_Vulkan.so
+
+          READELF="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for so in build/apkcheck/lib/arm64-v8a/*.so; do
+            "$READELF" -h "$so" | grep -q 'Machine:.*AArch64'
+          done
+
+      - name: Build evidence manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/Android-Trainer-GPU-Gate-debug.apk
+          (
+            cd dist
+            sha256sum Android-Trainer-GPU-Gate-debug.apk > SHA256SUMS
+          )
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          p=pathlib.Path("dist/BUILD_MANIFEST.json")
+          data={
+            "schema":"android_trainer_build_manifest_v1",
+            "android_trainer_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
+            "mnn_commit":subprocess.check_output(["git","-C","vendor/MNN","rev-parse","HEAD"],text=True).strip(),
+            "ndk_version":os.environ["ANDROID_NDK_VERSION"],
+            "compile_sdk":os.environ["ANDROID_COMPILE_SDK"],
+            "build_tools":os.environ["ANDROID_BUILD_TOOLS"],
+            "abi":["arm64-v8a"],
+            "precision_gate":"FP32",
+            "opencl":True,
+            "vulkan_buffer":True,
+            "mnn_build_train":True,
+          }
+          p.write_text(json.dumps(data,indent=2)+"\n")
+          PY
+
+      - name: Upload APK + evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-Trainer-GPU-Gate
+          path: |
+            dist/Android-Trainer-GPU-Gate-debug.apk
+            dist/SHA256SUMS
+            dist/BUILD_MANIFEST.json
+          if-no-files-found: error
+          retention-days: 14
