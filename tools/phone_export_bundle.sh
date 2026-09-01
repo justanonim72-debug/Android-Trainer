@@ -30,7 +30,7 @@ run_inside_ubuntu() {
     set -euo pipefail
     PY=/root/mobilellm-ref/.venv/bin/python
     test -x \"\$PY\" || { echo 'STOP: Ubuntu PyTorch venv missing: /root/mobilellm-ref/.venv/bin/python' >&2; exit 1; }
-    \"\$PY\" '$exporter' --project '$PROJECT' --output '$OUT'
+    \"\$PY\" '$exporter' --project '$PROJECT' --checkpoint '$CHECKPOINT' --output '$OUT'
   "
 }
 
