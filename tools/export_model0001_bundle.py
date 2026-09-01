@@ -92,6 +92,33 @@ def tensor_state_hash(state: dict) -> str:
     return h.hexdigest()
 
 
+def assert_model_fp32(model, label: str) -> None:
+    """Fail closed unless the loaded reference model is already FP32.
+
+    The completed script-17 RotaryEmbedding intentionally defines a static
+    helper named _apply(x, cos, sin). PyTorch module-wide dtype/device
+    conversion helpers (including Module.float()) recursively dispatch the
+    framework method nn.Module._apply(fn) and collide with that engine helper.
+    The completed checkpoint is already FP32, so the exporter verifies dtype
+    without mutating or converting the frozen engine.
+    """
+    bad_params = [
+        (name, str(param.dtype))
+        for name, param in model.named_parameters()
+        if param.dtype != torch.float32
+    ]
+    bad_buffers = [
+        (name, str(buf.dtype))
+        for name, buf in model.named_buffers()
+        if torch.is_floating_point(buf) and buf.dtype != torch.float32
+    ]
+    if bad_params or bad_buffers:
+        raise SystemExit(
+            f"STOP: {label} is not already FP32 after strict checkpoint load; "
+            f"non_fp32_params={bad_params[:8]} "
+            f"non_fp32_floating_buffers={bad_buffers[:8]}"
+        )
+
 def import_engine(project: Path):
     p = project / "scripts" / "17_pretrain_model0001.py"
     if not p.exists():
@@ -622,7 +649,7 @@ def main():
 
     model = eng.Model0001(engine_cfg)
     model.load_state_dict(ck["model"], strict=True)
-    model.float()
+    assert_model_fp32(model, "PyTorch reference model")
     model.train()
     nparams = sum(p.numel() for p in model.parameters())
     if nparams != EXPECTED["params"]:
@@ -682,7 +709,7 @@ def main():
     # Fresh optimizer gate reference using the REAL engine grouping/betas/eps.
     ref_model = eng.Model0001(engine_cfg)
     ref_model.load_state_dict(ck["model"], strict=True)
-    ref_model.float()
+    assert_model_fp32(ref_model, "fresh AdamW reference model")
     ref_model.train()
     ref_opt = make_fresh_reference_optimizer(ref_model, hp)
     ref_opt.zero_grad(set_to_none=True)
