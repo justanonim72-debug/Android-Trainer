@@ -307,7 +307,7 @@ std::map<VARP,VARP> gradients(Graph& g) {
 
     std::map<VARP,VARP> m;
     for(size_t i=0;i<params.size();++i) {
-        if(grads[i]) m.emplace(params[i],grads[i]);
+        if(grads[i].get()!=nullptr) m.emplace(params[i],grads[i]);
     }
     requireCompleteGradients(g,m,"dynamic parity");
     return m;
