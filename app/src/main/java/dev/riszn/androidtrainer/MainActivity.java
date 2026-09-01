@@ -188,7 +188,7 @@ public final class MainActivity extends Activity {
         if (!manifestFile.isFile()) throw new IllegalStateException("manifest.json missing");
         String text = new String(java.nio.file.Files.readAllBytes(manifestFile.toPath()), java.nio.charset.StandardCharsets.UTF_8);
         JSONObject manifest = new JSONObject(text);
-        if (!"android_trainer_bundle_v1".equals(manifest.getString("schema")))
+        if (!"android_trainer_bundle_v2".equals(manifest.getString("schema")))
             throw new IllegalStateException("wrong bundle schema");
         JSONObject tensors = manifest.getJSONObject("tensors");
         Iterator<String> names = tensors.keys();
@@ -207,6 +207,10 @@ public final class MainActivity extends Activity {
         File sample = canonicalChild(root, manifest.getJSONObject("sample").getString("tokens_file"));
         if (!sample.isFile() || sample.length() != 257L * 4L)
             throw new IllegalStateException("bad sample token file");
+        JSONObject sampleSpec = manifest.getJSONObject("sample");
+        if (!sampleSpec.has("sha256") ||
+            !sha256(sample).equalsIgnoreCase(sampleSpec.getString("sha256")))
+            throw new IllegalStateException("sample SHA mismatch");
         append("verified tensor bytes: " + total);
     }
 
