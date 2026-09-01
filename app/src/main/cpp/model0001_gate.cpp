@@ -879,6 +879,16 @@ StaticParityResult staticParity(
     }
     markStage(r.backend+":static_parity:pre_teardown_snapshot:done");
 
+    // The Android 15 Mali-G610 tombstone from this exact gate shows SIGSEGV
+    // inside libGLES_mali.so -> clReleaseKernel while MNN tears down the
+    // OpenCL runtime from Interpreter::releaseSession().  Complete the
+    // session explicitly before entering any resource destruction.  MNN's
+    // waitSessionFinish() maps to Backend::onSync(..., toCpu=true), and the
+    // OpenCL backend implements that as commandQueue().finish().
+    markStage(r.backend+":static_parity:wait_session_finish:start");
+    net->waitSessionFinish(session);
+    markStage(r.backend+":static_parity:wait_session_finish:done");
+
     markStage(r.backend+":static_parity:release_session:start");
     const bool released=net->releaseSession(session);
     markStage(
