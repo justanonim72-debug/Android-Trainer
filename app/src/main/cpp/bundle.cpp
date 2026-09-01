@@ -116,7 +116,7 @@ Bundle Bundle::load(const std::string& rootDir) {
     b.checkpointSha256 = asString(b.manifest, "checkpoint_sha256");
     b.trainBinSha256 = asString(b.manifest, "train_bin_sha256");
     b.ropeStyle = asString(b.manifest, "rope_style");
-    require(b.ropeStyle == "half_split" || b.ropeStyle == "interleaved", "unsupported RoPE style");
+    require(b.ropeStyle == "half_split" || b.ropeStyle == "interleaved" || b.ropeStyle == "auto", "unsupported RoPE style");
     require(b.manifest.HasMember("parameter_count") && b.manifest["parameter_count"].IsInt64(), "bad parameter_count");
     b.parameterCount = b.manifest["parameter_count"].GetInt64();
     require(b.parameterCount == 19145088, "parameter-count drift");
