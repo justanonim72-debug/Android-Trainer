@@ -224,7 +224,18 @@ public final class MainActivity extends Activity {
                 wl = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AndroidTrainer:Gate");
                 wl.acquire(45L * 60L * 1000L);
                 float thermal = thermalHeadroom();
+                long gateStartNs = android.os.SystemClock.elapsedRealtimeNanos();
                 String out = nativeRunGate(bundleDir.getAbsolutePath(), getFilesDir().getAbsolutePath(), thermal);
+                float thermalEnd = thermalHeadroom();
+                double gateSeconds = (android.os.SystemClock.elapsedRealtimeNanos() - gateStartNs) / 1.0e9;
+                try {
+                    JSONObject reportObj = new JSONObject(out);
+                    reportObj.put("thermal_headroom_end", Float.isNaN(thermalEnd) ? JSONObject.NULL : thermalEnd);
+                    reportObj.put("gate_wall_seconds", gateSeconds);
+                    out = reportObj.toString();
+                } catch (Exception ignored) {
+                    // Preserve native diagnostic text if it is not JSON.
+                }
                 lastReport = out;
                 File report = new File(getFilesDir(), "last_gate_report.json");
                 try (FileOutputStream os = new FileOutputStream(report)) {
