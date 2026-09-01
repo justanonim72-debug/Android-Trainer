@@ -1143,33 +1143,77 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
                 std::to_string(thermalHeadroom)+",\"cpu_parity\":"+parityJson(cpu)+"}";
         }
 
-        // 2) Exact dynamic graph parity on the approved GPU candidate.
-        // Project policy keeps Vulkan out of training; OpenCL is the only GPU
-        // backend evaluated for migration.
-        markStage("run:opencl_parity:start");
-        Parity cl=safeDynamicParity(b,MNN_FORWARD_OPENCL,MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
-        markStage("run:opencl_parity:done");
-        Parity vk; vk.backend="VULKAN"; vk.pass=false; vk.error="disabled_by_project_policy";
+        // 2) The phone has already proven that MNN Express dynamic OpenCL
+        // parity is the wrong execution architecture for this gate: Android
+        // killed the process with REASON_LOW_MEMORY exactly at
+        // OPENCL:dynamic:gradnorm:start, where hostGlobalNorm() materializes
+        // every gradient tensor on the host. Keep dynamic autograd as the CPU
+        // oracle, but move GPU correctness to a serialized Session graph so MNN
+        // can plan/reuse all non-output intermediate memory.
+        Parity clDynamic;
+        clDynamic.backend="OPENCL";
+        clDynamic.pass=false;
+        clDynamic.error="skipped: proven Android LOW_MEMORY during dynamic OpenCL gradient materialization";
+        Parity vk;
+        vk.backend="VULKAN";
+        vk.pass=false;
+        vk.error="disabled_by_project_policy";
 
-        // 3) Serialize one backend-neutral static AdamW training loop and benchmark
-        // independent fresh sessions. This avoids timing MNN's dynamic graph rebuild path.
-        const std::string base=workDir+"/model0001-gate-static-base.mnn";
-        markStage("run:static_build:start");
-        buildStaticAdamWModel(b,base);
-        markStage("run:static_build:done");
-        const int steps=20;
-        markStage("run:cpu_static:start");
-        Bench bc=benchStatic(b,base,workDir,MNN_FORWARD_CPU,0,steps);
-        markStage("run:cpu_static:done");
-        req(bc.available&&bc.finite&&bc.checkpointReloadOk,"CPU static training/checkpoint reference failed");
-        Bench bg;
-        if(cl.pass) {
-            markStage("run:opencl_static:start");
-            bg=safeBenchStatic(b,base,workDir,MNN_FORWARD_OPENCL,
-                               MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
-            markStage("run:opencl_static:done");
+        // 3) Serialize a read-only one-step parity graph with ONLY compact
+        // outputs: loss, global grad norm, the locked logit probes, the locked
+        // gradient probes, and the locked fresh-state AdamW probes. This checks
+        // the same semantics as CPU dynamic parity without copying 74 complete
+        // gradients back from GPU.
+        const std::string parityModel=workDir+"/model0001-gate-static-parity.mnn";
+        markStage("run:static_parity_build:start");
+        auto paritySpec=buildStaticParityModel(b,parityModel);
+        markStage("run:static_parity_build:done");
+
+        markStage("run:cpu_static_parity:start");
+        auto cpuStatic=safeStaticParity(b,paritySpec,MNN_FORWARD_CPU,0);
+        markStage("run:cpu_static_parity:done");
+        if(!cpuStatic.pass) {
+            return std::string("{\"status\":\"FAIL_CPU_STATIC_PARITY\",\"thermal_headroom_start\":")+
+                std::to_string(thermalHeadroom)+
+                ",\"cpu_dynamic\":"+parityJson(cpu)+
+                ",\"cpu_static\":"+staticParityJson(cpuStatic)+"}";
         }
-        else { bg.backend="OPENCL"; }
+
+        markStage("run:opencl_static_parity:start");
+        auto clStatic=safeStaticParity(
+            b,paritySpec,MNN_FORWARD_OPENCL,
+            MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
+        markStage("run:opencl_static_parity:done");
+        if(!clStatic.pass) {
+            return std::string("{\"status\":\"FAIL_OPENCL_STATIC_PARITY\",\"thermal_headroom_start\":")+
+                std::to_string(thermalHeadroom)+
+                ",\"cpu_dynamic\":"+parityJson(cpu)+
+                ",\"cpu_static\":"+staticParityJson(cpuStatic)+
+                ",\"opencl_static\":"+staticParityJson(clStatic)+
+                ",\"opencl_runtime\":"+openClProbe()+"}";
+        }
+
+        // 4) Only after exact static OpenCL parity passes, build the stateful
+        // AdamW loop and measure sustained CPU vs OpenCL training. This graph
+        // is backend-neutral and each Session gets its own independent state.
+        const std::string base=workDir+"/model0001-gate-static-base.mnn";
+        markStage("run:static_train_build:start");
+        buildStaticAdamWModel(b,base);
+        markStage("run:static_train_build:done");
+
+        const int steps=20;
+        markStage("run:cpu_static_train:start");
+        Bench bc=benchStatic(b,base,workDir,MNN_FORWARD_CPU,0,steps);
+        markStage("run:cpu_static_train:done");
+        req(bc.available&&bc.finite&&bc.checkpointReloadOk,
+            "CPU static training/checkpoint reference failed");
+
+        markStage("run:opencl_static_train:start");
+        Bench bg=safeBenchStatic(
+            b,base,workDir,MNN_FORWARD_OPENCL,
+            MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
+        markStage("run:opencl_static_train:done");
+
         Bench bv;
         bv.backend="VULKAN";
         bv.error="disabled_by_project_policy";
@@ -1178,35 +1222,42 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         const double clRatio=(cpuT>0&&bg.tokps>0)?bg.tokps/cpuT:0.0;
         const double vkRatio=0.0;
 
-        // Acceptance is deliberately evidence-based, not "GPU did not crash".
-        // 1.5x is reported as useful; 2x is the recommended canonical-switch threshold.
-        const bool clUseful=cl.pass&&bg.finite&&bg.checkpointReloadOk&&clRatio>=1.5;
-        const bool clCanonical=cl.pass&&bg.finite&&bg.checkpointReloadOk&&clRatio>=2.0;
-        const bool vkUseful=vk.pass&&bv.finite&&bv.checkpointReloadOk&&vkRatio>=1.5;
-        const bool vkCanonical=vk.pass&&bv.finite&&bv.checkpointReloadOk&&vkRatio>=2.0;
+        // A training backend is accepted only after static correctness has
+        // passed. Speed alone can never promote it.
+        const bool clTrainOk=
+            bg.available&&bg.finite&&bg.checkpointReloadOk&&bg.gpuOps>0;
+        const bool clUseful=clTrainOk&&clRatio>=1.5;
+        const bool clCanonical=clTrainOk&&clRatio>=2.0;
+        const bool vkUseful=false;
+        const bool vkCanonical=false;
 
         std::string winner="CPU";
         if(clCanonical){winner="OPENCL";}
 
         std::ostringstream o;
-        o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v1\""
+        o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v2\""
          <<",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT<<"\""
          <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
          <<",\"model_state_sha256\":\""<<b.modelStateSha256<<"\""
          <<",\"rope_evidence\":\""<<jsonEscape(ropeEvidence)<<"\""
          <<",\"thermal_headroom_start\":"<<thermalHeadroom
          <<",\"opencl_runtime\":"<<openClProbe()
-         <<",\"parity\":{\"cpu\":"<<parityJson(cpu)<<",\"opencl\":"<<parityJson(cl)
-         <<",\"vulkan_buffer\":"<<parityJson(vk)<<"}"
-         <<",\"static_train\":{\"cpu\":"<<benchJson(bc)<<",\"opencl\":"<<benchJson(bg)
+         <<",\"dynamic_parity\":{\"cpu\":"<<parityJson(cpu)
+         <<",\"opencl\":"<<parityJson(clDynamic)<<"}"
+         <<",\"static_parity\":{\"cpu\":"<<staticParityJson(cpuStatic)
+         <<",\"opencl\":"<<staticParityJson(clStatic)<<"}"
+         <<",\"static_train\":{\"cpu\":"<<benchJson(bc)
+         <<",\"opencl\":"<<benchJson(bg)
          <<",\"vulkan_buffer\":"<<benchJson(bv)<<"}"
-         <<",\"speed_ratio\":{\"opencl_vs_cpu\":"<<clRatio<<",\"vulkan_vs_cpu\":"<<vkRatio<<"}"
+         <<",\"speed_ratio\":{\"opencl_vs_cpu\":"<<clRatio
+         <<",\"vulkan_vs_cpu\":"<<vkRatio<<"}"
          <<",\"useful_1_5x\":{\"opencl\":"<<(clUseful?"true":"false")
          <<",\"vulkan_buffer\":"<<(vkUseful?"true":"false")<<"}"
          <<",\"canonical_2x\":{\"opencl\":"<<(clCanonical?"true":"false")
          <<",\"vulkan_buffer\":"<<(vkCanonical?"true":"false")<<"}"
          <<",\"recommended_backend\":\""<<winner<<"\""
-         <<",\"note\":\"Benchmark is exact Model #0001 FP32 forward/backward/fresh-state decoupled AdamW with checkpoint-derived per-parameter decay grouping; backend switch remains stage-boundary only.\"}";
+         <<",\"note\":\"GPU correctness is validated through a memory-planned static FP32 graph exposing only locked scalar probes; dynamic OpenCL full-gradient host materialization is intentionally excluded after an Android LOW_MEMORY kill. Backend switch remains stage-boundary only.\"}";
+        markStage("run:success");
         return o.str();
     } catch(const std::exception& e) {
         return std::string("{\"status\":\"FAIL\",\"error\":\"")+jsonEscape(e.what())+"\"}";
