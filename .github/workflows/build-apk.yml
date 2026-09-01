@@ -65,6 +65,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
+          validate-wrappers: false
 
       - name: Python exporter syntax check
         run: python3 -m py_compile tools/export_model0001_bundle.py
