@@ -284,9 +284,31 @@ void requireCompleteGradients(const Graph& g,const std::map<VARP,VARP>& gm,const
 
 std::map<VARP,VARP> gradients(Graph& g) {
     OpGrad::init();
-    std::set<VARP> ps;
-    for(auto& kv:g.params) ps.insert(kv.second);
-    auto m=OpGrad::grad(g.loss,ps);
+
+    // Do not differentiate the numerically-stable logsumexp loss expression
+    // through MNN 3.6.1. Its ReduceMaxGrad normalizes the max mask with a
+    // global ReduceSum(mask), not along the requested reduction axis, so a
+    // row-wise [S,V] max produces an incorrect backward seed.
+    //
+    // For mean cross entropy the exact analytic seed at logits is:
+    //     dL/dlogits = (softmax(logits) - onehot(targets)) / S
+    // Seed autograd at logits and differentiate only the actual model graph.
+    // This preserves the exact PyTorch loss gradient while avoiding the known
+    // loss-expression backward defect in the pinned MNN train module.
+    auto onehot=_OneHot(g.targetInput,_Scalar<int32_t>(V),scalar(1.0f),scalar(0.0f),-1);
+    auto dlogits=(_Softmax(g.logits,1)-onehot)/scalar(static_cast<float>(S));
+
+    std::vector<VARP> params;
+    params.reserve(g.params.size());
+    for(const auto& kv:g.params) params.push_back(kv.second);
+
+    auto grads=OpGrad::gradLinear(g.logits,params,{dlogits});
+    req(grads.size()==params.size(),"dynamic parity: MNN gradLinear size mismatch");
+
+    std::map<VARP,VARP> m;
+    for(size_t i=0;i<params.size();++i) {
+        if(grads[i]) m.emplace(params[i],grads[i]);
+    }
     requireCompleteGradients(g,m,"dynamic parity");
     return m;
 }
@@ -444,10 +466,9 @@ StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
     // independently by CPU/OpenCL/Vulkan sessions.
     auto exe=makeExecutor(MNN_FORWARD_CPU,4,0); ExecutorScope scope(exe);
     auto g=buildGraph(b);
-    OpGrad::init();
-    std::set<VARP> pset; for(auto& kv:g.params) pset.insert(kv.second);
-    auto gm=OpGrad::grad(g.loss,pset);
-    requireCompleteGradients(g,gm,"static AdamW");
+    // Reuse the exact analytic cross-entropy seed used by dynamic parity.
+    // Static training must not reintroduce MNN 3.6.1's ReduceMaxGrad defect.
+    auto gm=gradients(g);
 
     VARP sum=scalar(0.0f);
     for(auto& kv:gm) sum=sum+_ReduceSum(_Square(kv.second),{},false);
