@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT="/storage/emulated/0/Download/friend_core_corpus_bootstrap_v1"
 OUT="/storage/emulated/0/Download/model0001-gpu-gate.atb"
+CHECKPOINT="$PROJECT/artifacts/model0001_runs/model0001_cpt_v2_epoch1/latest.pt"
 EXPECTED_MODEL_SHA="047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d"
 
 SELF="$(cd "$(dirname "$0")" && pwd)/export_model0001_bundle.py"
@@ -20,6 +21,8 @@ echo "Android-Trainer Model #0001 CPT-v2 bundle export"
 echo "Expected final model SHA: $EXPECTED_MODEL_SHA"
 echo "Project: $PROJECT"
 echo "Output : $OUT"
+echo "Checkpoint: $CHECKPOINT"
+test -f "$CHECKPOINT" || { echo "STOP: final CPT-v2 latest.pt missing: $CHECKPOINT" >&2; exit 1; }
 
 run_inside_ubuntu() {
   local exporter="$1"
@@ -32,7 +35,7 @@ run_inside_ubuntu() {
 }
 
 if [ -x /root/mobilellm-ref/.venv/bin/python ]; then
-  /root/mobilellm-ref/.venv/bin/python "$SELF" --project "$PROJECT" --output "$OUT"
+  /root/mobilellm-ref/.venv/bin/python "$SELF" --project "$PROJECT" --checkpoint "$CHECKPOINT" --output "$OUT"
 elif command -v proot-distro >/dev/null 2>&1; then
   run_inside_ubuntu "$SELF"
 else
