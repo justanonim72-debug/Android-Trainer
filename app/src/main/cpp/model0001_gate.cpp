@@ -607,8 +607,32 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
     try {
         auto b=Bundle::load(dir);
 
-        // 1) Reference parity on MNN CPU. If this fails, GPU results are meaningless.
-        Parity cpu=dynamicParity(b,MNN_FORWARD_CPU,0);
+        // 1) Reference parity on MNN CPU. If the Python source did not expose
+        // the RoPE layout clearly, empirically select between the two standard
+        // layouts using the frozen PyTorch reference. Nothing is guessed silently.
+        Parity cpu;
+        std::string ropeEvidence;
+        if (b.ropeStyle == "auto") {
+            b.ropeStyle = "half_split";
+            Parity half = dynamicParity(b,MNN_FORWARD_CPU,0);
+            if (half.pass) {
+                cpu = half;
+                ropeEvidence = "auto->half_split";
+            } else {
+                b.ropeStyle = "interleaved";
+                Parity inter = dynamicParity(b,MNN_FORWARD_CPU,0);
+                if (inter.pass) {
+                    cpu = inter;
+                    ropeEvidence = "auto->interleaved";
+                } else {
+                    return std::string("{\"status\":\"FAIL_CPU_PARITY\",\"reason\":\"neither supported RoPE layout matches PyTorch\",\"half_split\":")+
+                        parityJson(half)+",\"interleaved\":"+parityJson(inter)+"}";
+                }
+            }
+        } else {
+            ropeEvidence = "declared->" + b.ropeStyle;
+            cpu = dynamicParity(b,MNN_FORWARD_CPU,0);
+        }
         if(!cpu.pass) {
             return std::string("{\"status\":\"FAIL_CPU_PARITY\",\"thermal_headroom_start\":")+
                 std::to_string(thermalHeadroom)+",\"cpu_parity\":"+parityJson(cpu)+"}";
@@ -652,6 +676,7 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v1\""
          <<",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT<<"\""
          <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
+         <<",\"rope_evidence\":\""<<jsonEscape(ropeEvidence)<<"\""
          <<",\"thermal_headroom_start\":"<<thermalHeadroom
          <<",\"opencl_runtime\":"<<openClProbe()
          <<",\"parity\":{\"cpu\":"<<parityJson(cpu)<<",\"opencl\":"<<parityJson(cl)
