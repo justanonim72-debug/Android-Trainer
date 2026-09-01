@@ -1,6 +1,8 @@
 package dev.riszn.androidtrainer;
 
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
@@ -26,6 +28,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.security.MessageDigest;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -105,6 +108,67 @@ public final class MainActivity extends Activity {
         scroller.addView(log);
         root.addView(scroller, new LinearLayout.LayoutParams(-1, 0, 1f));
         setContentView(root);
+        showPreviousExitDiagnostics();
+    }
+
+    private void showPreviousExitDiagnostics() {
+        if (Build.VERSION.SDK_INT < 30) return;
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (am == null) return;
+            List<ApplicationExitInfo> infos = am.getHistoricalProcessExitReasons(null, 0, 8);
+            ApplicationExitInfo chosen = null;
+            for (ApplicationExitInfo info : infos) {
+                int r = info.getReason();
+                if (r == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                    r == ApplicationExitInfo.REASON_CRASH ||
+                    r == ApplicationExitInfo.REASON_SIGNALED ||
+                    r == ApplicationExitInfo.REASON_LOW_MEMORY ||
+                    r == ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE ||
+                    r == ApplicationExitInfo.REASON_ANR) {
+                    chosen = info;
+                    break;
+                }
+            }
+            File stageFile = new File(getFilesDir(), "last_native_stage.txt");
+            String stage = stageFile.isFile()
+                    ? new String(java.nio.file.Files.readAllBytes(stageFile.toPath()),
+                                 java.nio.charset.StandardCharsets.UTF_8)
+                    : "(none)";
+            append("\n=== PREVIOUS PROCESS EXIT ===");
+            append("last_native_stage: " + stage);
+            if (chosen == null) {
+                append("no crash/kill record found in ApplicationExitInfo");
+                return;
+            }
+            append("reason: " + exitReasonName(chosen.getReason()) + " (" + chosen.getReason() + ")");
+            append("status/signal: " + chosen.getStatus());
+            append("timestamp_ms: " + chosen.getTimestamp());
+            append("pss_kb: " + chosen.getPss());
+            append("rss_kb: " + chosen.getRss());
+            String d = chosen.getDescription();
+            if (d != null && !d.isEmpty()) append("description: " + d);
+        } catch (Throwable t) {
+            append("exit diagnostic unavailable: " + t);
+        }
+    }
+
+    private static String exitReasonName(int r) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            switch (r) {
+                case ApplicationExitInfo.REASON_CRASH_NATIVE: return "CRASH_NATIVE";
+                case ApplicationExitInfo.REASON_CRASH: return "CRASH_JAVA";
+                case ApplicationExitInfo.REASON_SIGNALED: return "SIGNALED";
+                case ApplicationExitInfo.REASON_LOW_MEMORY: return "LOW_MEMORY";
+                case ApplicationExitInfo.REASON_ANR: return "ANR";
+                case ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE: return "EXCESSIVE_RESOURCE_USAGE";
+                case ApplicationExitInfo.REASON_EXIT_SELF: return "EXIT_SELF";
+                case ApplicationExitInfo.REASON_USER_REQUESTED: return "USER_REQUESTED";
+                case ApplicationExitInfo.REASON_PACKAGE_UPDATED: return "PACKAGE_UPDATED";
+                default: return "REASON_" + r;
+            }
+        }
+        return "UNKNOWN";
     }
 
     private Button button(String text) {
@@ -217,6 +281,12 @@ public final class MainActivity extends Activity {
     private void runGate() {
         if (bundleDir == null) return;
         append("\n=== EXACT MODEL GATE ===");
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                if (am != null) am.setProcessStateSummary("model0001-gate-running".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Throwable ignored) {}
+        }
         run.setEnabled(false);
         new Thread(() -> {
             PowerManager.WakeLock wl = null;
