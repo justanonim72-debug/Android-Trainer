@@ -44,7 +44,7 @@ def import_engine(project: Path):
     if spec is None or spec.loader is None: raise SystemExit("cannot import script 17")
     m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 
-def extract_cfg(ck: dict, run_config: dict | None, eng) -> dict:
+def extract_cfg(ck: dict, run_config: dict | None, eng) -> tuple[dict,dict]:
     candidates=[]
     for x in [
         ck.get("model_config"),
@@ -155,7 +155,7 @@ def detect_rope_style(engine_text:str) -> str:
     # pairwise rotary: even/odd slicing.
     if ("::2" in t and "1::2" in t) or ("0::2" in t and "1::2" in t):
         return "interleaved"
-    raise SystemExit("cannot prove RoPE layout from script17 source; refusing to guess")
+    return "auto"  # APK empirically tries both standard layouts against PyTorch reference.
 
 def optimizer_hparams(ck:dict, args) -> dict:
     opt=ck.get("optimizer")
@@ -202,7 +202,7 @@ def main():
     cfg=extract_cfg(ck,rc,eng)
     rope_style=detect_rope_style((project/"scripts"/"17_pretrain_model0001.py").read_text(errors="replace"))
 
-    model=eng.Model0001(dict(cfg))
+    model=eng.Model0001(dict(engine_cfg))
     model.load_state_dict(ck["model"],strict=True); model.float(); model.train()
     nparams=sum(p.numel() for p in model.parameters())
     if nparams!=EXPECTED["params"]: raise SystemExit(f"model params {nparams} != expected")
@@ -250,7 +250,7 @@ def main():
     hp=optimizer_hparams(ck,a)
 
     # Fresh AdamW one-step reference, keeping update semantics independent from backend state format.
-    ref_model=eng.Model0001(dict(cfg)); ref_model.load_state_dict(ck["model"],strict=True); ref_model.float(); ref_model.train()
+    ref_model=eng.Model0001(dict(engine_cfg)); ref_model.load_state_dict(ck["model"],strict=True); ref_model.float(); ref_model.train()
     opt=torch.optim.AdamW(ref_model.parameters(),lr=hp["gate_lr"],betas=(hp["beta1"],hp["beta2"]),
                           eps=hp["eps"],weight_decay=hp["weight_decay"])
     opt.zero_grad(set_to_none=True); _,l2=ref_model(x,y); l2.backward()
