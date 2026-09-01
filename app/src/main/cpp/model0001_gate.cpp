@@ -145,6 +145,7 @@ VARP causalMask() {
 struct Graph {
     VARP tokenInput;
     VARP targetInput;
+    VARP embeddingLookup;
     VARP logits;
     VARP loss;
     std::map<std::string,VARP> params;
@@ -166,6 +167,8 @@ Graph buildGraph(const Bundle& b) {
     auto embed=addP("tok_embeddings.weight");
     auto axis0=_Scalar<int32_t>(0);
     auto x=_GatherV2(embed,g.tokenInput,axis0); // [S,D]
+    g.embeddingLookup=x;
+    g.embeddingLookup->setName("embedding_lookup");
     auto mask=causalMask();
 
     for(int l=0;l<8;++l) {
@@ -299,23 +302,56 @@ std::map<VARP,VARP> gradients(Graph& g) {
     //
     // For mean cross entropy the exact analytic seed at logits is:
     //     dL/dlogits = (softmax(logits) - onehot(targets)) / S
-    // Seed autograd at logits and differentiate only the actual model graph.
-    // This preserves the exact PyTorch loss gradient while avoiding the known
-    // loss-expression backward defect in the pinned MNN train module.
     auto onehot=_OneHot(g.targetInput,_Scalar<int32_t>(V),scalar(1.0f),scalar(0.0f),-1);
     auto dlogits=(_Softmax(g.logits,1)-onehot)/scalar(static_cast<float>(S));
 
-    std::vector<VARP> params;
-    params.reserve(g.params.size());
-    for(const auto& kv:g.params) params.push_back(kv.second);
+    // The pinned MNN GatherGrad is not correct for an embedding lookup:
+    //   indices [S] -> reshape [S,1]
+    //   backwardOutput [S,D] -> UNSQUEEZE(axis=0) -> [1,S,D]
+    //   ScatterNd(indices, updates, shape) with no ADD reduction
+    //
+    // ScatterNd's own API/tests require updates [S,D] for indices [S,1], and
+    // repeated token ids must be accumulated with BinaryOpOperation_ADD.
+    // The embedding is tied, so its exact gradient is the sum of:
+    //   (a) direct LM-head MatMul gradient, and
+    //   (b) input embedding-lookup gradient scattered back by token id.
+    //
+    // Ask MNN autograd for all model parameters PLUS the lookup activation,
+    // while blocking propagation through the Gather expression. This keeps the
+    // correct direct LM-head contribution to the tied embedding, returns the
+    // downstream dL/d(lookup), and prevents buggy GatherGrad from contributing.
+    std::vector<VARP> targets;
+    targets.reserve(g.params.size()+1);
+    for(const auto& kv:g.params) targets.push_back(kv.second);
+    targets.push_back(g.embeddingLookup);
 
-    auto grads=OpGrad::gradLinear(g.logits,params,{dlogits});
-    req(grads.size()==params.size(),"dynamic parity: MNN gradLinear size mismatch");
+    auto grads=OpGrad::gradLinear(g.logits,targets,{dlogits},{"embedding_lookup"});
+    req(grads.size()==targets.size(),"dynamic parity: MNN gradLinear size mismatch");
 
     std::map<VARP,VARP> m;
-    for(size_t i=0;i<params.size();++i) {
-        if(grads[i].get()!=nullptr) m.emplace(params[i],grads[i]);
+    for(size_t i=0;i<g.params.size();++i) {
+        if(grads[i].get()!=nullptr) m.emplace(targets[i],grads[i]);
     }
+
+    auto lookupGrad=grads.back();
+    req(lookupGrad.get()!=nullptr,"dynamic parity: embedding lookup gradient missing");
+
+    auto embIt=g.params.find("tok_embeddings.weight");
+    req(embIt!=g.params.end(),"dynamic parity: tied embedding parameter missing");
+    auto directIt=m.find(embIt->second);
+    req(directIt!=m.end(),"dynamic parity: direct LM-head embedding gradient missing");
+
+    auto tokenIndex=_Reshape(g.tokenInput,{S,1});
+    int32_t embShapeData[2]={V,D};
+    auto embShape=_Const(embShapeData,{2},NHWC,halide_type_of<int32_t>());
+    auto lookupWeightGrad=_ScatterNd(
+        tokenIndex,
+        lookupGrad,
+        embShape,
+        MNN::BinaryOpOperation_ADD
+    );
+    directIt->second=directIt->second+lookupWeightGrad;
+
     requireCompleteGradients(g,m,"dynamic parity");
     return m;
 }
