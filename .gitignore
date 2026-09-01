@@ -1,0 +1,11 @@
+/.gradle/
+/build/
+/app/build/
+/vendor/
+/local.properties
+*.iml
+.idea/
+*.atb
+*.mnn
+*.json
+!docs/*.json
