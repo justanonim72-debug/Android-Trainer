@@ -82,20 +82,25 @@ VARP rotateHalf(VARP x, const std::string& style) {
         req(halves.size() == 2, "RoPE split failed");
         return _Concat({_Negative(halves[1]), halves[0]}, 3);
     }
-    // Interleaved [-x1,x0,-x3,x2,...] implemented by moving last dim to axis 0,
-    // gathering paired indices, moving it back, then applying a fixed sign mask.
-    std::vector<int32_t> idx(HD);
-    std::vector<float> sign(HD);
-    for (int i = 0; i < HD; i += 2) {
-        idx[i] = i + 1; idx[i + 1] = i;
-        sign[i] = -1.0f; sign[i + 1] = 1.0f;
-    }
-    auto xt = _Transpose(x, {3, 0, 1, 2});
-    auto iv = _Const(idx.data(), {HD}, NHWC, halide_type_of<int32_t>());
-    auto g = _GatherV2(xt, iv, _Scalar<int32_t>(0));
-    auto back = _Transpose(g, {1, 2, 3, 0});
-    auto sv = _Const(sign.data(), {1, 1, 1, HD}, NHWC);
-    return back * sv;
+    // Interleaved [-x1,x0,-x3,x2,...] without GatherV2.
+    //
+    // MNN 3.6.1 GatherGrad reconstructs axis-0 gradients through ScatterNd
+    // with an extra Unsqueeze, and the train tree has no gradient regression
+    // test covering this path.  Forward was numerically exact while the CPU
+    // backward showed near-2.0 relative probe errors.  Reshape each even/odd
+    // pair, split the last axis, then concatenate {-odd, even}; this is exactly
+    // the same RoPE permutation/sign transform and uses only Reshape/Slice/
+    // Concat/Neg gradients that are explicitly registered in the pinned MNN.
+    auto pairs = _Reshape(x, {1, HQ, S, HD / 2, 2});
+    // K has HKV heads before repeatKv, Q has HQ heads. Preserve the runtime
+    // head count instead of hard-coding it in the reshape.
+    auto info = x->getInfo();
+    req(info && info->dim.size() == 4 && info->dim[3] == HD, "RoPE input shape invalid");
+    const int heads = info->dim[1];
+    pairs = _Reshape(x, {1, heads, S, HD / 2, 2});
+    auto eo = _Split(pairs, {1, 1}, 4);
+    req(eo.size() == 2, "RoPE interleaved pair split failed");
+    return _Reshape(_Concat({_Negative(eo[1]), eo[0]}, 4), {1, heads, S, HD});
 }
 
 std::pair<VARP,VARP> rope(VARP q, VARP k, const Bundle& b) {
@@ -262,6 +267,9 @@ struct Parity {
     double loss=0, lossAbs=0;
     double gradNorm=0, gradNormRel=0;
     double maxLogitAbs=0, maxGradProbeAbs=0, maxGradProbeRel=0, maxAdamAbs=0, maxAdamRel=0;
+    std::string worstGradSlot, worstAdamSlot;
+    int worstGradIndex=-1, worstAdamIndex=-1;
+    double worstGradRef=0, worstGradGot=0, worstAdamRef=0, worstAdamGot=0;
     BackendCounts counts;
     bool pass=false;
     std::string error;
@@ -406,8 +414,16 @@ Parity dynamicParity(const Bundle& b,MNNForwardType type,int gpuMode) {
         const auto& inds=rg["probe_indices"]; const auto& vals=rg["probe_values"];
         for(rapidjson::SizeType i=0;i<inds.Size();++i) {
             int idx=inds[i].GetInt(); double ref=vals[i].GetDouble(), got=gd[idx];
-            p.maxGradProbeAbs=std::max(p.maxGradProbeAbs,std::abs(got-ref));
-            p.maxGradProbeRel=std::max(p.maxGradProbeRel,relerr(got,ref));
+            const double ae=std::abs(got-ref);
+            const double re=relerr(got,ref);
+            if(ae>p.maxGradProbeAbs) {
+                p.maxGradProbeAbs=ae;
+                p.worstGradSlot=slot;
+                p.worstGradIndex=idx;
+                p.worstGradRef=ref;
+                p.worstGradGot=got;
+            }
+            p.maxGradProbeRel=std::max(p.maxGradProbeRel,re);
         }
 
         const float* nd=upd.pnew.at(slot)->readMap<float>(); req(nd,"AdamW update map failed");
@@ -415,8 +431,16 @@ Parity dynamicParity(const Bundle& b,MNNForwardType type,int gpuMode) {
         const auto& ai=ra["probe_indices"]; const auto& av=ra["after"];
         for(rapidjson::SizeType i=0;i<ai.Size();++i) {
             int idx=ai[i].GetInt(); double ref=av[i].GetDouble(), got=nd[idx];
-            p.maxAdamAbs=std::max(p.maxAdamAbs,std::abs(got-ref));
-            p.maxAdamRel=std::max(p.maxAdamRel,relerr(got,ref));
+            const double ae=std::abs(got-ref);
+            const double re=relerr(got,ref);
+            if(ae>p.maxAdamAbs) {
+                p.maxAdamAbs=ae;
+                p.worstAdamSlot=slot;
+                p.worstAdamIndex=idx;
+                p.worstAdamRef=ref;
+                p.worstAdamGot=got;
+            }
+            p.maxAdamRel=std::max(p.maxAdamRel,re);
         }
     }
 
@@ -451,6 +475,10 @@ std::string parityJson(const Parity& p) {
      <<",\"max_grad_probe_rel_error\":"<<p.maxGradProbeRel
      <<",\"max_adamw_probe_abs_error\":"<<p.maxAdamAbs
      <<",\"max_adamw_probe_rel_error\":"<<p.maxAdamRel
+     <<",\"worst_grad\":{\"slot\":\""<<jsonEscape(p.worstGradSlot)<<"\",\"index\":"<<p.worstGradIndex
+     <<",\"ref\":"<<p.worstGradRef<<",\"got\":"<<p.worstGradGot<<"}"
+     <<",\"worst_adamw\":{\"slot\":\""<<jsonEscape(p.worstAdamSlot)<<"\",\"index\":"<<p.worstAdamIndex
+     <<",\"ref\":"<<p.worstAdamRef<<",\"got\":"<<p.worstAdamGot<<"}"
      <<",\"backend_counts\":{\"cpu\":"<<p.counts.cpu<<",\"opencl\":"<<p.counts.opencl
      <<",\"vulkan\":"<<p.counts.vulkan<<",\"other\":"<<p.counts.other
      <<",\"callbacks\":"<<p.counts.callbacks<<"},\"error\":\""<<jsonEscape(p.error)<<"\"}";
