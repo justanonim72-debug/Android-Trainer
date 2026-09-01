@@ -137,25 +137,107 @@ def normalized_config(raw: dict) -> dict:
     return out
 
 
-def exact_state(model) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
-    state = model.state_dict()
-    actual_tensor_keys = {k for k, v in state.items() if torch.is_tensor(v)}
-    expected_keys = set(NORMALIZED_TO_SOURCE.values())
-    if actual_tensor_keys != expected_keys:
-        missing = sorted(expected_keys - actual_tensor_keys)
-        extra = sorted(actual_tensor_keys - expected_keys)
-        raise SystemExit(
-            "STOP: Model #0001 state layout drift. "
-            f"missing={missing[:10]} extra={extra[:10]}"
-        )
+def _semantic_kind(name: str, shape: tuple[int, ...]) -> str | None:
+    n = name.lower()
+    if shape == (14000, 384):
+        return "tok_embeddings"
+    if shape == (384, 384):
+        if re.search(r"(^|[._])(q|query)([._]|$)", n):
+            return "q_proj"
+        if re.search(r"(^|[._])(o|out|output)([._]|$)", n):
+            return "o_proj"
+    if shape == (128, 384):
+        if re.search(r"(^|[._])(k|key)([._]|$)", n):
+            return "k_proj"
+        if re.search(r"(^|[._])(v|value)([._]|$)", n):
+            return "v_proj"
+    if shape == (1152, 384):
+        if "gate" in n or re.search(r"(^|[._])w1([._]|$)", n):
+            return "gate_proj"
+        if re.search(r"(^|[._])up([._]|$)", n) or re.search(r"(^|[._])w3([._]|$)", n):
+            return "up_proj"
+    if shape == (384, 1152):
+        return "down_proj"
+    if shape == (384,):
+        if any(x in n for x in ["attn_norm", "attention_norm", "input_layernorm", "ln1", "norm1"]):
+            return "attn_norm"
+        if any(x in n for x in ["ffn_norm", "post_attention", "post_attn", "ln2", "norm2"]):
+            return "ffn_norm"
+    return None
 
-    out = {}
-    for slot, src in NORMALIZED_TO_SOURCE.items():
-        out[slot] = state[src].detach().cpu().float().contiguous()
-    unique = sum(x.numel() for x in out.values())
-    if unique != EXPECTED["params"]:
-        raise SystemExit(f"STOP: normalized params={unique:,} != {EXPECTED['params']:,}")
-    return out, dict(NORMALIZED_TO_SOURCE)
+
+def exact_state(model) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    params = {k: v for k, v in model.named_parameters()}
+    if sum(p.numel() for p in params.values()) != EXPECTED["params"]:
+        raise SystemExit("STOP: Model #0001 trainable parameter count drift")
+
+    # Fast exact-name path for the reference implementation.
+    expected_keys = set(NORMALIZED_TO_SOURCE.values())
+    if set(params) == expected_keys:
+        out = {
+            slot: params[src].detach().cpu().float().contiguous()
+            for slot, src in NORMALIZED_TO_SOURCE.items()
+        }
+        return out, dict(NORMALIZED_TO_SOURCE)
+
+    # Strict semantic fallback. Every mapping must be unique and every trainable
+    # parameter must be consumed; otherwise export stops rather than guessing.
+    layer_re = re.compile(r"(?:^|\.)(?:blocks|layers|h)\.(\d+)(?:\.|$)", re.I)
+    embedding = [(k, p) for k, p in params.items() if tuple(p.shape) == (14000, 384)]
+    if len(embedding) != 1:
+        raise SystemExit(f"STOP: expected exactly one 14000x384 tied embedding, got {[k for k,_ in embedding]}")
+
+    out = {"tok_embeddings.weight": embedding[0][1].detach().cpu().float().contiguous()}
+    origin = {"tok_embeddings.weight": embedding[0][0]}
+    consumed = {embedding[0][0]}
+    layers = {i: {} for i in range(8)}
+    outside_norm = []
+
+    for name, p in params.items():
+        if name in consumed:
+            continue
+        shape = tuple(p.shape)
+        m = layer_re.search(name)
+        if m:
+            li = int(m.group(1))
+            if li not in layers:
+                raise SystemExit(f"STOP: unexpected layer index in parameter {name}")
+            kind = _semantic_kind(name, shape)
+            if kind is None:
+                raise SystemExit(f"STOP: cannot semantically classify trainable parameter {name} shape={shape}")
+            if kind in layers[li]:
+                raise SystemExit(f"STOP: ambiguous layer {li} {kind}: {layers[li][kind][0]} vs {name}")
+            layers[li][kind] = (name, p)
+        elif shape == (384,) and "norm" in name.lower():
+            outside_norm.append((name, p))
+        else:
+            raise SystemExit(f"STOP: unexpected trainable parameter outside blocks: {name} shape={shape}")
+
+    need = ["attn_norm", "q_proj", "k_proj", "v_proj", "o_proj",
+            "ffn_norm", "gate_proj", "up_proj", "down_proj"]
+    for li in range(8):
+        missing = [k for k in need if k not in layers[li]]
+        if missing:
+            raise SystemExit(f"STOP: layer {li} semantic mapping missing {missing}")
+        for kind in need:
+            src, p = layers[li][kind]
+            slot = f"layers.{li}.{kind}.weight"
+            out[slot] = p.detach().cpu().float().contiguous()
+            origin[slot] = src
+            consumed.add(src)
+
+    if len(outside_norm) != 1:
+        raise SystemExit(f"STOP: expected exactly one final norm outside blocks, got {[k for k,_ in outside_norm]}")
+    src, p = outside_norm[0]
+    out["final_norm.weight"] = p.detach().cpu().float().contiguous()
+    origin["final_norm.weight"] = src
+    consumed.add(src)
+
+    if consumed != set(params):
+        raise SystemExit(f"STOP: unconsumed trainable parameters: {sorted(set(params)-consumed)}")
+    if sum(x.numel() for x in out.values()) != EXPECTED["params"]:
+        raise SystemExit("STOP: normalized parameter count drift")
+    return out, origin
 
 
 def detect_rope_style(engine_text: str) -> str:
@@ -389,6 +471,7 @@ def optimizer_semantics(model, ck: dict, origin: dict[str, str], gate_lr: float)
         "source_checkpoint_lr_values": source_lrs,
         "slot_group": slot_group,
         "slot_weight_decay": slot_wd,
+        "slot_source_name": dict(origin),
     }
 
 
@@ -407,7 +490,7 @@ def make_fresh_reference_optimizer(model, hp: dict):
 
     named = dict(model.named_parameters())
     groups = {}
-    for slot, src in NORMALIZED_TO_SOURCE.items():
+    for slot, src in hp["slot_source_name"].items():
         gi = hp["slot_group"][slot]
         groups.setdefault(gi, {"params": [], "weight_decay": hp["slot_weight_decay"][slot]})
         groups[gi]["params"].append(named[src])
