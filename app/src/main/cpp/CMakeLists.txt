@@ -34,7 +34,7 @@ target_include_directories(android_trainer PRIVATE
     "${MNN_ROOT}/tools/train/source"
     "${MNN_ROOT}/tools/train/source/grad"
     "${MNN_ROOT}/tools/train/source/optimizer"
-    "${MNN_ROOT}/3rd_party/rapidjson/include"
+    "${MNN_ROOT}/3rd_party/rapidjson"
     "${MNN_ROOT}/3rd_party/OpenCLHeaders"
 )
 target_compile_definitions(android_trainer PRIVATE
