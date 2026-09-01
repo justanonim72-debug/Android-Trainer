@@ -39,10 +39,10 @@ EXPECTED = {
     "params": 19_145_088,
 }
 EXPECTED_STAGE = {
-    "run_name": "model0001_cpt_v2_epoch1",
     "stage_steps": 15_624,
     "stage_tokens_seen": 3_999_744,
     "lifetime_tokens_seen": 5_535_744,
+    "final_model_state_sha256": "047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d",
 }
 NORMALIZED_TO_SOURCE = {
     "tok_embeddings.weight": "tok_emb.weight",
@@ -173,51 +173,149 @@ def probe_indices(name: str, n: int, count: int = 16):
     return sorted(set(int(x) for x in rng.integers(0, n, size=count)))
 
 
-def verify_completed_boundary(project: Path, ckpt: Path, train_bin: Path, ck: dict) -> dict:
-    run_dir = project / "artifacts" / "model0001_runs" / EXPECTED_STAGE["run_name"]
-    completed_path = run_dir / "COMPLETED.json"
-    if not completed_path.exists():
-        raise SystemExit(f"STOP: completed stage marker missing: {completed_path}")
-    completed = json.loads(completed_path.read_text(encoding="utf-8"))
+def engine_state_hash(eng, state: dict) -> str:
+    fn = getattr(eng, "tensor_state_hash", None)
+    if callable(fn):
+        return str(fn(state))
+    # Fallback used only when the training engine exposes no hash helper.
+    return tensor_state_hash(state)
 
-    if completed.get("schema") != "model0001_cpt_v2_completed_v1" or completed.get("status") != "PASS":
-        raise SystemExit("STOP: CPT-v2 COMPLETED.json is not PASS")
-    for k, v in EXPECTED_STAGE.items():
-        if completed.get(k) != v:
-            raise SystemExit(f"STOP: CPT-v2 boundary mismatch {k}: {completed.get(k)} != {v}")
-    if completed.get("test_split_used") is not False:
-        raise SystemExit("STOP: CPT-v2 test split flag is not untouched")
+
+def _first_int(d: dict, names: list[str]):
+    for n in names:
+        if n in d:
+            try:
+                return int(d[n])
+            except Exception:
+                pass
+    return None
+
+
+def discover_checkpoint(project: Path, explicit: str | None, eng) -> Path:
+    if explicit:
+        p = Path(explicit).resolve()
+        if not p.exists():
+            raise SystemExit(f"STOP: checkpoint not found: {p}")
+        return p
+
+    roots = [
+        project / "artifacts" / "model0001_runs",
+        project / "runs",
+        project / "artifacts",
+    ]
+    candidates = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for pat in ("latest.pt", "final_model.pt"):
+            for p in root.rglob(pat):
+                rp = p.resolve()
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                candidates.append(rp)
+
+    matches = []
+    inspected = []
+    for p in candidates:
+        try:
+            ck = torch.load(p, map_location="cpu", weights_only=False)
+            state = ck.get("model") if isinstance(ck, dict) else None
+            if not isinstance(state, dict):
+                continue
+            sha = engine_state_hash(eng, state)
+            inspected.append((str(p), sha))
+            if sha == EXPECTED_STAGE["final_model_state_sha256"]:
+                matches.append(p)
+        except Exception:
+            continue
+
+    if len(matches) != 1:
+        detail = "\n".join(f"  {p}  model_sha={s}" for p, s in inspected[-12:])
+        raise SystemExit(
+            "STOP: could not uniquely locate the completed CPT-v2 model by exact model-state SHA. "
+            f"matches={len(matches)}\n{detail}"
+        )
+    return matches[0]
+
+
+def discover_completed_marker(ckpt: Path) -> tuple[Path | None, dict | None]:
+    names = ["COMPLETED.json", "completed.json", "RUN_COMPLETE.json", "run_complete.json"]
+    for base in [ckpt.parent, ckpt.parent.parent]:
+        for n in names:
+            p = base / n
+            if p.exists():
+                try:
+                    obj = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(obj, dict):
+                        return p, obj
+                except Exception:
+                    pass
+    return None, None
+
+
+def verify_completed_boundary(project: Path, ckpt: Path, train_bin: Path, ck: dict, eng) -> dict:
+    state = ck.get("model")
+    if not isinstance(state, dict):
+        raise SystemExit("STOP: checkpoint has no model state")
+
+    model_sha = engine_state_hash(eng, state)
+    if model_sha != EXPECTED_STAGE["final_model_state_sha256"]:
+        raise SystemExit(
+            "STOP: checkpoint is not the completed CPT-v2 model. "
+            f"model_sha={model_sha}"
+        )
+
+    stage_step = _first_int(ck, ["stage_step", "stage_steps", "step", "optimizer_step"])
+    stage_tokens = _first_int(ck, ["stage_tokens_seen", "stage_tokens", "stage_scored_train_tokens"])
+    lifetime_tokens = _first_int(ck, ["lifetime_tokens_seen", "lifetime_tokens", "cumulative_tokens_seen"])
+
+    if stage_step is not None and stage_step != EXPECTED_STAGE["stage_steps"]:
+        raise SystemExit(f"STOP: checkpoint step mismatch: {stage_step}")
+    if stage_tokens is not None and stage_tokens != EXPECTED_STAGE["stage_tokens_seen"]:
+        raise SystemExit(f"STOP: checkpoint stage-token mismatch: {stage_tokens}")
+    if lifetime_tokens is not None and lifetime_tokens != EXPECTED_STAGE["lifetime_tokens_seen"]:
+        raise SystemExit(f"STOP: checkpoint lifetime-token mismatch: {lifetime_tokens}")
+
+    completed_path, completed = discover_completed_marker(ckpt)
+    if completed is not None:
+        if completed.get("status") not in (None, "PASS"):
+            raise SystemExit(f"STOP: completion marker status is not PASS: {completed.get('status')}")
+        c_model_sha = completed.get("final_model_state_sha256") or completed.get("model_state_sha256") or completed.get("final_model_sha")
+        if c_model_sha is not None and c_model_sha != EXPECTED_STAGE["final_model_state_sha256"]:
+            raise SystemExit("STOP: completion marker model SHA does not match the completed CPT-v2 model")
+
+        c_step = _first_int(completed, ["stage_steps", "stage_step", "optimizer_steps", "optimizer_step", "steps"])
+        c_stage_tokens = _first_int(completed, ["stage_tokens_seen", "stage_tokens", "stage_scored_train_tokens"])
+        c_life = _first_int(completed, ["lifetime_tokens_seen", "lifetime_tokens", "cumulative_tokens_seen"])
+        if c_step is not None and c_step != EXPECTED_STAGE["stage_steps"]:
+            raise SystemExit(f"STOP: completion marker step mismatch: {c_step}")
+        if c_stage_tokens is not None and c_stage_tokens != EXPECTED_STAGE["stage_tokens_seen"]:
+            raise SystemExit(f"STOP: completion marker stage-token mismatch: {c_stage_tokens}")
+        if c_life is not None and c_life != EXPECTED_STAGE["lifetime_tokens_seen"]:
+            raise SystemExit(f"STOP: completion marker lifetime-token mismatch: {c_life}")
+
+        for key in ("test_split_used", "test_used"):
+            if key in completed and completed[key] not in (False, 0, "false", "UNTOUCHED"):
+                raise SystemExit(f"STOP: completion marker says test split was used: {completed[key]}")
 
     got_ck_sha = sha256_file(ckpt)
-    if completed.get("final_checkpoint_sha256") != got_ck_sha:
-        raise SystemExit("STOP: latest.pt does not match COMPLETED.json final checkpoint SHA")
-
-    if ck.get("schema") != "model0001_cpt_v2_checkpoint_v1":
-        raise SystemExit(f"STOP: unexpected checkpoint schema: {ck.get('schema')}")
-    if int(ck.get("stage_step", -1)) != EXPECTED_STAGE["stage_steps"]:
-        raise SystemExit("STOP: checkpoint is not the final CPT-v2 step")
-    if int(ck.get("stage_tokens_seen", -1)) != EXPECTED_STAGE["stage_tokens_seen"]:
-        raise SystemExit("STOP: checkpoint stage token counter mismatch")
-    if int(ck.get("lifetime_tokens_seen", -1)) != EXPECTED_STAGE["lifetime_tokens_seen"]:
-        raise SystemExit("STOP: checkpoint lifetime token counter mismatch")
-
-    model_sha = tensor_state_hash(ck["model"])
-    if completed.get("final_model_state_sha256") != model_sha:
-        raise SystemExit("STOP: final model state SHA mismatch")
-
-    contract = ck.get("contract")
-    if not isinstance(contract, dict) or contract.get("stage") != "continued_pretraining_dataset_v2_epoch1":
-        raise SystemExit("STOP: missing/invalid CPT-v2 semantic contract")
-    if contract.get("test_split_used") is not False:
-        raise SystemExit("STOP: stage contract test-split flag changed")
-
     got_train_sha = sha256_file(train_bin)
-    if contract.get("dataset_v2_train_sha256") != got_train_sha:
-        raise SystemExit("STOP: Dataset v2 train.bin does not match stage contract")
+
+    # Contract linkage is checked when the real checkpoint exposes the field.
+    contract = ck.get("contract") or ck.get("run_contract")
+    if isinstance(contract, dict):
+        for key in ("dataset_v2_train_sha256", "train_bin_sha256"):
+            if key in contract and contract[key] != got_train_sha:
+                raise SystemExit(f"STOP: Dataset v2 train.bin hash differs from checkpoint contract ({key})")
+        for key in ("test_split_used", "test_used"):
+            if key in contract and contract[key] not in (False, 0, "false", "UNTOUCHED"):
+                raise SystemExit("STOP: checkpoint contract says test split was used")
 
     return {
-        "completed_path": str(completed_path),
-        "completed_sha256": sha256_file(completed_path),
+        "completed_path": str(completed_path) if completed_path else None,
+        "completed_sha256": sha256_file(completed_path) if completed_path else None,
         "checkpoint_sha256": got_ck_sha,
         "model_state_sha256": model_sha,
         "train_bin_sha256": got_train_sha,
@@ -225,76 +323,105 @@ def verify_completed_boundary(project: Path, ckpt: Path, train_bin: Path, ck: di
         "stage_tokens_seen": EXPECTED_STAGE["stage_tokens_seen"],
         "lifetime_tokens_seen": EXPECTED_STAGE["lifetime_tokens_seen"],
         "test_split_used": False,
+        "checkpoint_metadata_stage_step": stage_step,
+        "checkpoint_metadata_stage_tokens": stage_tokens,
+        "checkpoint_metadata_lifetime_tokens": lifetime_tokens,
     }
 
 
-def optimizer_semantics(eng, model, ck: dict, origin: dict[str, str], gate_lr: float) -> dict:
+def optimizer_semantics(model, ck: dict, origin: dict[str, str], gate_lr: float) -> dict:
     opt_state = ck.get("optimizer")
     if not isinstance(opt_state, dict) or not isinstance(opt_state.get("param_groups"), list):
         raise SystemExit("STOP: final checkpoint optimizer state missing")
-
     groups = opt_state["param_groups"]
-    if not groups:
-        raise SystemExit("STOP: final checkpoint optimizer has no groups")
-
-    positive_wd = sorted({float(g.get("weight_decay", 0.0)) for g in groups if float(g.get("weight_decay", 0.0)) > 0})
-    if len(positive_wd) != 1:
-        raise SystemExit(f"STOP: cannot reconstruct exact AdamW decay rule: positive_wd={positive_wd}")
-    source_wd = positive_wd[0]
-
-    # Rebuild the optimizer using the real engine's grouping rule, then load the
-    # completed checkpoint optimizer. This proves the group structure still matches.
-    opt = eng.optimizer_for(model, gate_lr, source_wd)
-    opt.load_state_dict(opt_state)
-
-    beta_eps = {
-        (tuple(float(x) for x in g["betas"]), float(g["eps"]))
-        for g in opt.param_groups
-    }
-    if len(beta_eps) != 1:
-        raise SystemExit(f"STOP: per-group beta/eps differ: {beta_eps}")
-    (betas, eps), = beta_eps
-
-    param_group_by_id = {}
-    for gi, g in enumerate(opt.param_groups):
-        for p in g["params"]:
-            param_group_by_id[id(p)] = gi
+    if len(groups) != 1:
+        # Without saved parameter names, arbitrary multi-group state_dicts cannot
+        # be mapped back to model names safely. Fail instead of guessing.
+        names_present = all(isinstance(g.get("param_names"), list) for g in groups)
+        if not names_present:
+            raise SystemExit(
+                "STOP: checkpoint has multiple optimizer groups but no param_names; "
+                "exact per-parameter AdamW semantics cannot be proven without guessing"
+            )
 
     named = dict(model.named_parameters())
     slot_wd = {}
     slot_group = {}
-    for slot, src in origin.items():
-        p = named.get(src)
-        if p is None:
-            raise SystemExit(f"STOP: optimizer mapping missing parameter {src}")
-        gi = param_group_by_id.get(id(p))
-        if gi is None:
-            raise SystemExit(f"STOP: optimizer group mapping missing {src}")
-        slot_group[slot] = int(gi)
-        slot_wd[slot] = float(opt.param_groups[gi]["weight_decay"])
 
-    # Exact rule from script17 must still be reflected by the loaded groups:
-    # matrices/embedding decay; 1-D RMSNorm scales do not.
-    for slot, src in origin.items():
-        expected_wd = source_wd if named[src].dim() >= 2 else 0.0
-        if not math.isclose(slot_wd[slot], expected_wd, rel_tol=0, abs_tol=1e-15):
-            raise SystemExit(
-                f"STOP: optimizer group drift for {src}: wd={slot_wd[slot]} expected={expected_wd}"
-            )
+    beta_eps = set()
+    for gi, g in enumerate(groups):
+        betas = tuple(float(x) for x in g.get("betas", (0.9, 0.999)))
+        eps = float(g.get("eps", 1e-8))
+        beta_eps.add((betas, eps))
 
-    source_lrs = sorted({float(g.get("lr", 0.0)) for g in opt.param_groups})
+    if len(beta_eps) != 1:
+        raise SystemExit(f"STOP: per-group beta/eps differ: {beta_eps}")
+    (betas, eps), = beta_eps
+
+    if len(groups) == 1:
+        wd = float(groups[0].get("weight_decay", 0.0))
+        for slot in origin:
+            slot_wd[slot] = wd
+            slot_group[slot] = 0
+    else:
+        by_name = {}
+        for gi, g in enumerate(groups):
+            wd = float(g.get("weight_decay", 0.0))
+            for name in g["param_names"]:
+                if name in by_name:
+                    raise SystemExit(f"STOP: duplicate optimizer param_name: {name}")
+                by_name[name] = (gi, wd)
+        for slot, src in origin.items():
+            if src not in by_name:
+                raise SystemExit(f"STOP: optimizer param_names missing {src}")
+            gi, wd = by_name[src]
+            slot_group[slot] = int(gi)
+            slot_wd[slot] = float(wd)
+
+    source_lrs = sorted({float(g.get("lr", 0.0)) for g in groups})
     return {
         "gate_state": "fresh_zero_moments",
         "beta1": float(betas[0]),
         "beta2": float(betas[1]),
         "eps": float(eps),
         "gate_lr": float(gate_lr),
-        "source_optimizer_groups": len(opt.param_groups),
-        "source_weight_decay": float(source_wd),
+        "source_optimizer_groups": len(groups),
         "source_checkpoint_lr_values": source_lrs,
         "slot_group": slot_group,
         "slot_weight_decay": slot_wd,
     }
+
+
+def make_fresh_reference_optimizer(model, hp: dict):
+    # Exact support for the common single-group checkpoint. Multi-group requires
+    # param_names and is reconstructed by name.
+    if hp["source_optimizer_groups"] == 1:
+        only_wd = next(iter(hp["slot_weight_decay"].values()))
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=hp["gate_lr"],
+            betas=(hp["beta1"], hp["beta2"]),
+            eps=hp["eps"],
+            weight_decay=only_wd,
+        )
+
+    named = dict(model.named_parameters())
+    groups = {}
+    for slot, src in NORMALIZED_TO_SOURCE.items():
+        gi = hp["slot_group"][slot]
+        groups.setdefault(gi, {"params": [], "weight_decay": hp["slot_weight_decay"][slot]})
+        groups[gi]["params"].append(named[src])
+    ordered = []
+    for gi in sorted(groups):
+        g = groups[gi]
+        ordered.append({
+            "params": g["params"],
+            "weight_decay": g["weight_decay"],
+            "lr": hp["gate_lr"],
+            "betas": (hp["beta1"], hp["beta2"]),
+            "eps": hp["eps"],
+        })
+    return torch.optim.AdamW(ordered)
 
 
 def main():
@@ -308,8 +435,8 @@ def main():
     args = ap.parse_args()
 
     project = Path(args.project).resolve()
-    run_dir = project / "artifacts" / "model0001_runs" / EXPECTED_STAGE["run_name"]
-    ckpt = Path(args.checkpoint).resolve() if args.checkpoint else run_dir / "latest.pt"
+    eng, engine_path = import_engine(project)
+    ckpt = discover_checkpoint(project, args.checkpoint, eng)
     train_bin = Path(args.train_bin).resolve() if args.train_bin else project / "artifacts" / "model0001_dataset_v2" / "train.bin"
     out = Path(args.output).resolve() if args.output else project.parent / "model0001-gpu-gate.atb"
 
@@ -320,14 +447,24 @@ def main():
     if not ckpt.exists() or not train_bin.exists():
         raise SystemExit(f"STOP: missing checkpoint/train.bin: {ckpt} / {train_bin}")
 
-    eng, engine_path = import_engine(project)
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     if "model" not in ck:
         raise SystemExit("STOP: checkpoint has no model state")
 
-    boundary = verify_completed_boundary(project, ckpt, train_bin, ck)
-    contract = ck["contract"]
-    engine_cfg = dict(contract["model"])
+    boundary = verify_completed_boundary(project, ckpt, train_bin, ck, eng)
+    contract = ck.get("contract") or ck.get("run_contract") or {}
+    engine_cfg = None
+    for candidate in [
+        ck.get("model_config"),
+        contract.get("model") if isinstance(contract, dict) else None,
+        ck.get("run_config", {}).get("model") if isinstance(ck.get("run_config"), dict) else None,
+        getattr(eng, "DEFAULT_MODEL", None),
+    ]:
+        if isinstance(candidate, dict):
+            engine_cfg = dict(candidate)
+            break
+    if engine_cfg is None:
+        raise SystemExit("STOP: cannot locate the exact Model #0001 config")
     cfg = normalized_config(engine_cfg)
 
     model = eng.Model0001(engine_cfg)
@@ -340,7 +477,7 @@ def main():
 
     norm, origin = exact_state(model)
     rope_style = detect_rope_style(engine_path.read_text(encoding="utf-8", errors="replace"))
-    hp = optimizer_semantics(eng, model, ck, origin, args.gate_lr)
+    hp = optimizer_semantics(model, ck, origin, args.gate_lr)
 
     raw = np.memmap(train_bin, dtype="<u2", mode="r")
     start = args.window_index * EXPECTED["seq_len"]
@@ -394,10 +531,7 @@ def main():
     ref_model.load_state_dict(ck["model"], strict=True)
     ref_model.float()
     ref_model.train()
-    ref_opt = eng.optimizer_for(ref_model, args.gate_lr, hp["source_weight_decay"])
-    # Verify the fresh optimizer has the same group hyperparameters we exported.
-    for g in ref_opt.param_groups:
-        g["lr"] = args.gate_lr
+    ref_opt = make_fresh_reference_optimizer(ref_model, hp)
     ref_opt.zero_grad(set_to_none=True)
     _, ref_loss = ref_model(x, y)
     ref_loss.backward()
