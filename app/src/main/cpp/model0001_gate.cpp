@@ -91,13 +91,12 @@ VARP rotateHalf(VARP x, const std::string& style) {
     // pair, split the last axis, then concatenate {-odd, even}; this is exactly
     // the same RoPE permutation/sign transform and uses only Reshape/Slice/
     // Concat/Neg gradients that are explicitly registered in the pinned MNN.
-    auto pairs = _Reshape(x, {1, HQ, S, HD / 2, 2});
     // K has HKV heads before repeatKv, Q has HQ heads. Preserve the runtime
     // head count instead of hard-coding it in the reshape.
     auto info = x->getInfo();
     req(info && info->dim.size() == 4 && info->dim[3] == HD, "RoPE input shape invalid");
     const int heads = info->dim[1];
-    pairs = _Reshape(x, {1, heads, S, HD / 2, 2});
+    auto pairs = _Reshape(x, {1, heads, S, HD / 2, 2});
     auto eo = _Split(pairs, {1, 1}, 4);
     req(eo.size() == 2, "RoPE interleaved pair split failed");
     return _Reshape(_Concat({_Negative(eo[1]), eo[0]}, 4), {1, heads, S, HD});
