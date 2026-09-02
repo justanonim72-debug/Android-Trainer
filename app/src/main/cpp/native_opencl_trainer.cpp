@@ -3473,4 +3473,34 @@ NativeGateResult runNativeModel0001Gate(
     return cached;
 }
 
+
+NativePilotResult runNativeModel0001LrPilot(
+    const Bundle& bundle,
+    const std::string& pilotRoot,
+    const std::string& workDir) {
+    static bool completed = false;
+    static NativePilotResult cached;
+    if (completed) return cached;
+    NativeTrainer* trainer = nullptr;
+    try {
+        const PilotPackageData pilot = loadPilotPackage(pilotRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        cached = trainer->runPilot(pilot);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_v3_lr_pilot_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(trainer ? trainer->currentStage() : "native:pilot:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":false"
+            << ",\"test_split_used\":false,\"pass\":false}";
+        cached = {false, out.str()};
+    }
+    completed = true;
+    return cached;
+}
+
 }  // namespace at
