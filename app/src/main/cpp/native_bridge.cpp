@@ -2,6 +2,8 @@
 #include <string>
 #include "model0001_gate.hpp"
 #include "native_opencl_conformance.hpp"
+#include "bundle.hpp"
+#include "native_opencl_trainer.hpp"
 
 namespace {
 std::string jstr(JNIEnv* env, jstring s) {
@@ -37,4 +39,22 @@ Java_dev_riszn_androidtrainer_MainActivity_nativeRunGate(
         JNIEnv* env, jclass, jstring bundleDir, jstring workDir, jfloat thermalHeadroom) {
     return ret(env, at::runModel0001GateJson(
         jstr(env, bundleDir), jstr(env, workDir), static_cast<float>(thermalHeadroom)));
+}
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_riszn_androidtrainer_MainActivity_nativeRunLrPilot(
+        JNIEnv* env, jclass, jstring bundleDir, jstring pilotDir, jstring workDir) {
+    try {
+        at::Bundle bundle = at::Bundle::load(jstr(env, bundleDir));
+        at::NativePilotResult result = at::runNativeModel0001LrPilot(
+            bundle, jstr(env, pilotDir), jstr(env, workDir));
+        return ret(env, result.json);
+    } catch (const std::exception& error) {
+        return ret(env,
+            std::string("{\"status\":\"FAIL_BRIDGE_EXCEPTION\",\"schema\":") +
+            "\"model0001_v3_lr_pilot_report_v1\",\"error\":\"" +
+            at::jsonEscape(error.what()) +
+            "\",\"production_lr_locked\":false,\"test_split_used\":false,\"pass\":false}");
+    }
 }
