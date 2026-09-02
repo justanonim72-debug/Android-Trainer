@@ -58,3 +58,21 @@ Java_dev_riszn_androidtrainer_MainActivity_nativeRunLrPilot(
             "\",\"production_lr_locked\":false,\"test_split_used\":false,\"pass\":false}");
     }
 }
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_riszn_androidtrainer_MainActivity_nativeRunStage(
+        JNIEnv* env, jclass, jstring bundleDir, jstring stageDir, jstring workDir) {
+    try {
+        at::Bundle bundle = at::Bundle::load(jstr(env, bundleDir));
+        at::NativeStageResult result = at::runNativeModel0001Stage(
+            bundle, jstr(env, stageDir), jstr(env, workDir));
+        return ret(env, result.json);
+    } catch (const std::exception& error) {
+        return ret(env,
+            std::string("{\"status\":\"FAIL_BRIDGE_EXCEPTION\",\"schema\":") +
+            "\"model0001_native_stage_report_v1\",\"error\":\"" +
+            at::jsonEscape(error.what()) +
+            "\",\"production_lr_locked\":true,\"test_split_used\":false,\"pass\":false}");
+    }
+}
