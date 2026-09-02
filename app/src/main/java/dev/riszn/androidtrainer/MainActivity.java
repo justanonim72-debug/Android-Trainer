@@ -14,6 +14,7 @@ import android.provider.MediaStore;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -742,6 +743,7 @@ public final class MainActivity extends Activity {
     private void runProductionStage() {
         if (bundleDir == null || stageDir == null || trainingActive) return;
         append("\n=== FOUNDATION-v3 PRODUCTION TRAINING ===");
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         trainingActive = true;
         run.setEnabled(false);
         pilotRun.setEnabled(false);
@@ -814,6 +816,8 @@ public final class MainActivity extends Activity {
                 trainingActive = false;
                 if (wl != null && wl.isHeld()) wl.release();
                 runOnUiThread(() -> {
+                    getWindow().clearFlags(
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     run.setEnabled(bundleDir != null);
                     updatePilotEnabled();
                     updateProductionEnabled();
