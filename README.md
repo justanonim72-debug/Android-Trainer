@@ -84,6 +84,20 @@ A backend is reported as:
 A real backend migration still occurs only at a semantic training-stage
 boundary.
 
+## Accepted physical GPU result
+
+The final physical-phone gate accepted commit
+`9201b188c13f3b5ac2f4dc790d3dcd7e1a45abc2` on Mali-G610 MC6 at
+**172.285 target tok/s**. Against the locked production CPU reference
+**78.38313427620264 target tok/s**, this is about **2.198x**. Forward,
+backward, AdamW, checkpoint clear/reload, and fresh-state sustained gates all
+passed under the existing FP32/no-fast-math/no-fallback constraints.
+
+This completes the backend gate. The next action is **not another benchmark**:
+run the production transition audit and then lock the next semantic objective
+(Foundation-v2 -> genuine SFT, or a genuinely new Foundation/Dataset-v3 if
+more foundation breadth/retention repair is required).
+
 ## Build
 
 Pushes to `gpu-gate-v1` run the complete GitHub Actions build. CI verifies:
