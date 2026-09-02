@@ -45,84 +45,6 @@ jobs:
           grep -q 'MNN_OPENCL' vendor/MNN/CMakeLists.txt
           grep -q 'MNN_VULKAN_IMAGE' vendor/MNN/source/backend/vulkan/CMakeLists.txt
 
-      - name: Patch pinned MNN Mali OpenCL teardown barrier
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("vendor/MNN/source/backend/opencl/core/runtime/OpenCLRuntime.cpp")
-          s = p.read_text(encoding="utf-8")
-          old = """OpenCLRuntime::~OpenCLRuntime() {
-          #ifdef LOG_VERBOSE
-              MNN_PRINT("start ~OpenCLRuntime !\\n");
-          #endif
-              clearEvent();
-              mBuildProgramMap.clear();
-              mCommandQueuePtr.reset();
-              mCommandQueueTuning.reset();
-              mRecordableQueuePtr.reset();
-              mContext.reset();
-              mFirstGPUDevicePtr.reset();
-          #ifdef LOG_VERBOSE
-              MNN_PRINT("end ~OpenCLRuntime !\\n");
-          #endif
-          }
-          """
-          new = """OpenCLRuntime::~OpenCLRuntime() {
-          #ifdef LOG_VERBOSE
-              MNN_PRINT("start ~OpenCLRuntime !\\n");
-          #endif
-              // Android Mali teardown hardening for the pinned 3.6.1 runtime.
-              //
-              // Device tombstone evidence from Mali-G610 MC6 shows:
-              // Session::~Session -> CLRuntime::~CLRuntime ->
-              // OpenCLRuntime::~OpenCLRuntime -> clReleaseKernel -> SIGSEGV.
-              // The faulting cl_kernel is already invalid/stale by the time the
-              // vendor driver dereferences it.  Put an explicit completion
-              // barrier on every queue before releasing events/kernels/programs.
-              //
-              // This is stronger than OpenCL strictly requires, but matches the
-              // conservative cleanup order documented by Arm and the same class
-              // of "wait for completion" mitigation used for Mali OpenCL by
-              // production mobile runtimes.  It changes teardown ordering only;
-              // graph math, FP32 precision, weights, AdamW, and scheduling stay
-              // untouched.
-              if (mCommandQueuePtr) {
-                  mCommandQueuePtr->finish();
-              }
-              if (mCommandQueueTuning &&
-                  mCommandQueueTuning.get() != mCommandQueuePtr.get()) {
-                  mCommandQueueTuning->finish();
-              }
-              if (mRecordableQueuePtr &&
-                  mRecordableQueuePtr.get() != mCommandQueuePtr.get() &&
-                  mRecordableQueuePtr.get() != mCommandQueueTuning.get()) {
-                  mRecordableQueuePtr->finish();
-              }
-
-              clearEvent();
-              mBuildProgramMap.clear();
-              mCommandQueuePtr.reset();
-              mCommandQueueTuning.reset();
-              mRecordableQueuePtr.reset();
-              mContext.reset();
-              mFirstGPUDevicePtr.reset();
-          #ifdef LOG_VERBOSE
-              MNN_PRINT("end ~OpenCLRuntime !\\n");
-          #endif
-          }
-          """
-          if old not in s:
-              raise SystemExit("STOP: pinned MNN OpenCLRuntime destructor no longer matches audited 3.6.1 source")
-          p.write_text(s.replace(old, new, 1), encoding="utf-8")
-          PY
-
-          grep -q 'mCommandQueuePtr->finish();' vendor/MNN/source/backend/opencl/core/runtime/OpenCLRuntime.cpp
-          grep -q 'mCommandQueueTuning->finish();' vendor/MNN/source/backend/opencl/core/runtime/OpenCLRuntime.cpp
-          grep -q 'mRecordableQueuePtr->finish();' vendor/MNN/source/backend/opencl/core/runtime/OpenCLRuntime.cpp
-
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -218,6 +140,9 @@ jobs:
             "opencl":True,
             "vulkan_buffer":True,
             "mnn_build_train":True,
+            "mnn_mali_teardown_patch":False,
+            "opencl_session_lifetime":"process_persistent_session",
+            "opencl_correctness_graph":"single_stateful_fp32_adamw",
             "frozen_model":{
               "params":19145088,
               "vocab":14000,

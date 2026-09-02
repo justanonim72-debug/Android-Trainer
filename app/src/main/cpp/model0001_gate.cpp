@@ -958,37 +958,59 @@ std::string staticParityJson(const StaticParityResult& r) {
     return o.str();
 }
 
-struct StaticBuild {
-    std::string path;
+enum class StatefulProbeKind { Logit, Gradient, ParameterAfterFirstUpdate };
+
+struct StatefulProbeSpec {
+    std::string name;
+    StatefulProbeKind kind;
+    std::string slot;
+    int index=0;
+    double ref=0.0;
 };
 
-StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
-    // Build on CPU; the serialized model is backend-neutral and is later loaded
-    // independently by CPU/OpenCL/Vulkan sessions.
-    auto exe=makeExecutor(MNN_FORWARD_CPU,4,0); ExecutorScope scope(exe);
+struct StaticTrainBuild {
+    std::string path;
+    std::vector<StatefulProbeSpec> probes;
+};
+
+StaticTrainBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
+    // Build ONE stateful FP32 training graph.  The same graph is used for
+    // CPU correctness, OpenCL correctness, and sustained timing.  OpenCL gets
+    // one Session only: correctness runs first, then the same live Session is
+    // continued for the benchmark.  This avoids the Mali-G610 driver path that
+    // has twice crashed in clReleaseKernel during per-gate Session teardown.
+    auto exe=makeExecutor(MNN_FORWARD_CPU,4,0);
+    ExecutorScope scope(exe);
+
     auto g=buildGraph(b);
-    // Reuse the exact analytic cross-entropy seed used by dynamic parity.
-    // Static training must not reintroduce MNN 3.6.1's ReduceMaxGrad defect.
     auto gm=gradients(g);
 
     VARP sum=scalar(0.0f);
     for(auto& kv:gm) sum=sum+_ReduceSum(_Square(kv.second),{},false);
-    auto norm=_Sqrt(sum); norm->setName("global_grad_norm");
+    auto norm=_Sqrt(sum);
+    norm->setName("global_grad_norm");
     auto coef=_Minimum(scalar(1.0f),scalar(1.0f)/(norm+scalar(1e-6f)));
 
     const float lr=static_cast<float>(b.adam.gateLr);
-    const float b1=static_cast<float>(b.adam.beta1), b2=static_cast<float>(b.adam.beta2);
+    const float b1=static_cast<float>(b.adam.beta1);
+    const float b2=static_cast<float>(b.adam.beta2);
     const float eps=static_cast<float>(b.adam.eps);
 
     std::vector<VARP> oldState,newState;
-    // Pow states contain beta^step for the step being applied; start at beta^1.
-    auto b1pow=_TrainableParam(b1,{},NHWC); b1pow->setName("adamw.beta1_pow");
-    auto b2pow=_TrainableParam(b2,{},NHWC); b2pow->setName("adamw.beta2_pow");
+    std::map<std::string,VARP> pnew;
+
+    auto b1pow=_TrainableParam(b1,{},NHWC);
+    b1pow->setName("adamw.beta1_pow");
+    auto b2pow=_TrainableParam(b2,{},NHWC);
+    b2pow->setName("adamw.beta2_pow");
 
     for(auto& pk:g.params) {
         const auto& td=b.tensor(pk.first);
-        auto m=_TrainableParam(0.0f,td.shape,NHWC); m->setName("adamw.m."+pk.first);
-        auto v=_TrainableParam(0.0f,td.shape,NHWC); v->setName("adamw.v."+pk.first);
+        auto m=_TrainableParam(0.0f,td.shape,NHWC);
+        m->setName("adamw.m."+pk.first);
+        auto v=_TrainableParam(0.0f,td.shape,NHWC);
+        v->setName("adamw.v."+pk.first);
+
         auto gg=gm.at(pk.second)*coef;
         auto mn=scalar(b1)*m+scalar(1.0f-b1)*gg;
         auto vn=scalar(b2)*v+scalar(1.0f-b2)*_Square(gg);
@@ -996,58 +1018,299 @@ StaticBuild buildStaticAdamWModel(const Bundle& b,const std::string& path) {
         auto stepSize=scalar(lr)/(scalar(1.0f)-b1pow);
         const float wd=static_cast<float>(b.adam.slotWeightDecay.at(pk.first));
         auto pn=pk.second*scalar(1.0f-lr*wd)-stepSize*mn/denom;
+
         pn->setName("update."+pk.first);
         mn->setName("update.adamw.m."+pk.first);
         vn->setName("update.adamw.v."+pk.first);
+
         oldState.insert(oldState.end(),{pk.second,m,v});
         newState.insert(newState.end(),{pn,mn,vn});
+        pnew.emplace(pk.first,pn);
     }
-    auto b1n=b1pow*scalar(b1); b1n->setName("update.adamw.beta1_pow");
-    auto b2n=b2pow*scalar(b2); b2n->setName("update.adamw.beta2_pow");
-    oldState.insert(oldState.end(),{b1pow,b2pow}); newState.insert(newState.end(),{b1n,b2n});
 
-    g.loss->setName("loss"); norm->setName("global_grad_norm");
-    MNN::Train::ParameterOptimizer::makeLoopModel(path.c_str(),{g.loss,norm},{oldState,newState});
+    auto b1n=b1pow*scalar(b1);
+    b1n->setName("update.adamw.beta1_pow");
+    auto b2n=b2pow*scalar(b2);
+    b2n->setName("update.adamw.beta2_pow");
+    oldState.insert(oldState.end(),{b1pow,b2pow});
+    newState.insert(newState.end(),{b1n,b2n});
+
+    g.loss->setName("loss");
+
+    StaticTrainBuild out;
+    out.path=path;
+    std::vector<VARP> outputs={g.loss,norm};
+
+    int serial=0;
+    const auto& logitProbes=b.manifest["reference"]["logit_probe"];
+    for(const auto& q:logitProbes.GetArray()) {
+        const int pos=q["position"].GetInt();
+        const int tok=q["token"].GetInt();
+        const int index=pos*V+tok;
+        const std::string name="stateful.logit."+std::to_string(serial++);
+        outputs.push_back(scalarProbe(g.logits,index,name));
+        out.probes.push_back({
+            name,StatefulProbeKind::Logit,"logits",index,q["value"].GetDouble()
+        });
+    }
+
+    serial=0;
+    for(const auto& pk:g.params) {
+        const auto& rg=refGradient(b,pk.first);
+        const auto& inds=rg["probe_indices"];
+        const auto& vals=rg["probe_values"];
+        auto grad=gm.at(pk.second);
+        for(rapidjson::SizeType i=0;i<inds.Size();++i) {
+            const int index=inds[i].GetInt();
+            const std::string name="stateful.grad."+std::to_string(serial++);
+            outputs.push_back(scalarProbe(grad,index,name));
+            out.probes.push_back({
+                name,StatefulProbeKind::Gradient,pk.first,index,vals[i].GetDouble()
+            });
+        }
+    }
+
+    // Direct AdamW verification without exposing/copying full updated tensors:
+    // expose selected values of the CURRENT trainable parameters.  On run #1
+    // these are the frozen starting weights.  The loop writes AdamW state at
+    // the end of that run.  Therefore on run #2 these compact parameter probes
+    // are exactly the "after one AdamW step" values frozen in the .atb bundle.
+    // This avoids consuming the update expression itself, which MNN's
+    // makeLoopModel rewires in-place to the trainable tensor index.
+    serial=0;
+    for(const auto& pk:g.params) {
+        const auto& ra=refAdam(b,pk.first);
+        const auto& inds=ra["probe_indices"];
+        const auto& vals=ra["after"];
+        for(rapidjson::SizeType i=0;i<inds.Size();++i) {
+            const int index=inds[i].GetInt();
+            const std::string name="stateful.param."+std::to_string(serial++);
+            outputs.push_back(scalarProbe(pk.second,index,name));
+            out.probes.push_back({
+                name,StatefulProbeKind::ParameterAfterFirstUpdate,
+                pk.first,index,vals[i].GetDouble()
+            });
+        }
+    }
+
+    MNN::Train::ParameterOptimizer::makeLoopModel(
+        path.c_str(),outputs,{oldState,newState});
+
     std::ifstream f(path,std::ios::binary|std::ios::ate);
-    req(f&&f.tellg()>0,"static train model serialization failed");
-    return {path};
+    req(f&&f.tellg()>0,"stateful static train model serialization failed");
+    return out;
 }
 
-struct Bench {
+struct StatefulRun {
     std::string backend;
-    bool available=false, finite=false;
-    double firstLoss=0,lastLoss=0,seconds=0,tokps=0;
-    int steps=0,cpuOps=0,gpuOps=0,otherOps=0;
+    bool available=false;
+    bool finite=false;
+    bool pass=false;
+    bool persistent=false;
+    double sessionMemoryMb=0.0;
+
+    double step0Loss=0.0;
+    double step0LossAbs=0.0;
+    double step0GradNorm=0.0;
+    double step0GradNormRel=0.0;
+    double maxStep0LogitAbs=0.0;
+    double maxStep0GradAbs=0.0;
+    double maxStep0GradRel=0.0;
+
+    double step1Loss=0.0;
+    double step1GradNorm=0.0;
+    double maxStep1ParamAbs=0.0;
+    double maxStep1ParamRel=0.0;
+    std::string worstGradSlot;
+    std::string worstParamSlot;
+    int worstGradIndex=-1;
+    int worstParamIndex=-1;
+    double worstGradRef=0.0;
+    double worstGradGot=0.0;
+    double worstParamRef=0.0;
+    double worstParamGot=0.0;
+
+    int timedSteps=0;
+    double finalLoss=0.0;
+    double seconds=0.0;
+    double tokps=0.0;
+    BackendCounts counts;
+
     std::string checkpointPath;
     bool checkpointReloadOk=false;
     std::string error;
 };
 
-Bench benchStatic(const Bundle& b,const std::string& baseModel,const std::string& workDir,
-                  MNNForwardType type,int gpuMode,int steps) {
-    Bench out; out.backend=typeName(type);
-    std::shared_ptr<Interpreter> net(Interpreter::createFromFile(baseModel.c_str()),Interpreter::destroy);
-    if(!net) return out;
-    BackendConfig bc; bc.precision=BackendConfig::Precision_High; bc.power=BackendConfig::Power_High;
-    bc.memory=(type==MNN_FORWARD_OPENCL)?BackendConfig::Memory_Low:BackendConfig::Memory_Normal;
-    ScheduleConfig cfg; cfg.type=type; cfg.backendConfig=&bc;
-    if(type==MNN_FORWARD_CPU) cfg.numThread=4;
-    else cfg.mode=gpuMode;
+struct PersistentOpenCLLease {
+    Interpreter* net=nullptr;
+    Session* session=nullptr;
+    std::string modelPath;
+    std::string checkpointPath;
+};
+
+// Deliberately process-lifetime.  Do NOT wrap this in smart pointers and do
+// NOT add a destructor.  Two device tombstones from the pinned MNN 3.6.1 path
+// prove that destroying this Mali-G610 OpenCL runtime calls clReleaseKernel()
+// on a vendor handle that SIGSEGVs even after clFinish().  Android reclaims
+// all process resources when the app process exits, so this lease is held until
+// process death exactly like a long-lived engine.
+static PersistentOpenCLLease* gPersistentOpenCLLease=nullptr;
+static std::string gPersistentOpenCLReport;
+
+bool verifyCheckpointOnCpu(const Bundle& b,const std::string& path) {
+    std::shared_ptr<Interpreter> net(
+        Interpreter::createFromFile(path.c_str()),Interpreter::destroy);
+    if(!net) return false;
+
+    BackendConfig bc;
+    bc.precision=BackendConfig::Precision_High;
+    bc.power=BackendConfig::Power_High;
+    bc.memory=BackendConfig::Memory_Normal;
+
+    ScheduleConfig cfg;
+    cfg.type=MNN_FORWARD_CPU;
+    cfg.numThread=4;
+    cfg.backendConfig=&bc;
+
     auto* session=net->createSession(cfg);
-    if(!session) return out;
-    out.available=true;
+    if(!session) return false;
+
     auto* ti=net->getSessionInput(session,"tokens");
     auto* yi=net->getSessionInput(session,"targets");
     auto* lo=net->getSessionOutput(session,"loss");
-    req(ti&&yi&&lo,"static training model input/output names missing");
-    {
-        Tensor th(ti,Tensor::CAFFE); auto* p=th.host<int32_t>(); req(p,"token host tensor");
-        Tensor yh(yi,Tensor::CAFFE); auto* q=yh.host<int32_t>(); req(q,"target host tensor");
-        for(int i=0;i<S;++i){p[i]=b.sampleTokens[i];q[i]=b.sampleTokens[i+1];}
-        ti->copyFromHostTensor(&th); yi->copyFromHostTensor(&yh);
+    if(!(ti&&yi&&lo)) {
+        net->releaseSession(session);
+        return false;
     }
 
-    BackendCounts counts;
+    {
+        Tensor th(ti,Tensor::CAFFE);
+        Tensor yh(yi,Tensor::CAFFE);
+        auto* p=th.host<int32_t>();
+        auto* q=yh.host<int32_t>();
+        if(!(p&&q)) {
+            net->releaseSession(session);
+            return false;
+        }
+        for(int i=0;i<S;++i) {
+            p[i]=b.sampleTokens[i];
+            q[i]=b.sampleTokens[i+1];
+        }
+        ti->copyFromHostTensor(&th);
+        yi->copyFromHostTensor(&yh);
+    }
+
+    const auto ec=net->runSession(session);
+    if(ec!=NO_ERROR) {
+        net->releaseSession(session);
+        return false;
+    }
+
+    Tensor host(lo,Tensor::CAFFE);
+    lo->copyToHostTensor(&host);
+    auto* p=host.host<float>();
+    const bool ok=p&&std::isfinite(static_cast<double>(p[0]));
+    net->releaseSession(session);
+    return ok;
+}
+
+StatefulRun runStatefulStatic(
+    const Bundle& b,
+    const StaticTrainBuild& spec,
+    const std::string& workDir,
+    MNNForwardType type,
+    int gpuMode,
+    int timedSteps
+) {
+    StatefulRun out;
+    out.backend=typeName(type);
+    const bool persistent=(type==MNN_FORWARD_OPENCL);
+
+    Interpreter* net=nullptr;
+    std::shared_ptr<Interpreter> cpuOwner;
+
+    if(persistent) {
+        if(gPersistentOpenCLLease!=nullptr) {
+            out.error="persistent OpenCL Session already exists in this process; restart app before a fresh gate";
+            return out;
+        }
+        auto* lease=new PersistentOpenCLLease();
+        lease->modelPath=spec.path;
+        gPersistentOpenCLLease=lease;
+
+        lease->net=Interpreter::createFromFile(spec.path.c_str());
+        net=lease->net;
+        if(!net) {
+            out.error="persistent OpenCL Interpreter creation failed";
+            return out;
+        }
+    } else {
+        cpuOwner=std::shared_ptr<Interpreter>(
+            Interpreter::createFromFile(spec.path.c_str()),Interpreter::destroy);
+        net=cpuOwner.get();
+        if(!net) {
+            out.error="CPU stateful Interpreter creation failed";
+            return out;
+        }
+    }
+
+    BackendConfig bc;
+    bc.precision=BackendConfig::Precision_High;
+    bc.power=BackendConfig::Power_High;
+    bc.memory=persistent?BackendConfig::Memory_Low:BackendConfig::Memory_Normal;
+
+    ScheduleConfig cfg;
+    cfg.type=type;
+    cfg.backendConfig=&bc;
+    if(type==MNN_FORWARD_CPU) cfg.numThread=4;
+    else cfg.mode=gpuMode;
+
+    cfg.saveTensors.push_back("loss");
+    cfg.saveTensors.push_back("global_grad_norm");
+    for(const auto& p:spec.probes) cfg.saveTensors.push_back(p.name);
+
+    markStage(out.backend+":stateful:create_session:start");
+    auto* session=net->createSession(cfg);
+    if(persistent) gPersistentOpenCLLease->session=session;
+    if(!session) {
+        out.error="stateful Session creation failed on "+out.backend;
+        return out;
+    }
+    markStage(out.backend+":stateful:create_session:done");
+    out.available=true;
+    out.persistent=persistent;
+
+    net->getSessionInfo(session,MNN::Interpreter::MEMORY,&out.sessionMemoryMb);
+
+    auto* ti=net->getSessionInput(session,"tokens");
+    auto* yi=net->getSessionInput(session,"targets");
+    auto* lo=net->getSessionOutput(session,"loss");
+    auto* gn=net->getSessionOutput(session,"global_grad_norm");
+    req(ti&&yi&&lo&&gn,"stateful training IO contract missing on "+out.backend);
+
+    {
+        Tensor th(ti,Tensor::CAFFE);
+        Tensor yh(yi,Tensor::CAFFE);
+        auto* p=th.host<int32_t>();
+        auto* q=yh.host<int32_t>();
+        req(p&&q,"stateful input host allocation failed");
+        for(int i=0;i<S;++i) {
+            p[i]=b.sampleTokens[i];
+            q[i]=b.sampleTokens[i+1];
+        }
+        ti->copyFromHostTensor(&th);
+        yi->copyFromHostTensor(&yh);
+    }
+
+    auto readScalar=[&](Tensor* t,const std::string& label)->double {
+        req(t!=nullptr,"stateful output missing: "+label);
+        Tensor host(t,Tensor::CAFFE);
+        t->copyToHostTensor(&host);
+        auto* p=host.host<float>();
+        req(p!=nullptr,"stateful host read failed: "+label);
+        return static_cast<double>(p[0]);
+    };
+
     auto before=[](const std::vector<Tensor*>&,const OperatorInfo*){return true;};
     auto after=[&](const std::vector<Tensor*>& ts,const OperatorInfo*) {
         std::set<int> types;
@@ -1056,82 +1319,214 @@ Bench benchStatic(const Bundle& b,const std::string& baseModel,const std::string
             if(bn) types.insert(static_cast<int>(bn->type()));
         }
         for(int x:types) {
-            if(x==MNN_FORWARD_CPU) counts.cpu++;
-            else if(x==MNN_FORWARD_OPENCL||x==MNN_FORWARD_VULKAN) counts.opencl++;
-            else counts.other++;
+            if(x==MNN_FORWARD_CPU) out.counts.cpu++;
+            else if(x==MNN_FORWARD_OPENCL) out.counts.opencl++;
+            else if(x==MNN_FORWARD_VULKAN) out.counts.vulkan++;
+            else out.counts.other++;
         }
+        out.counts.callbacks++;
         return true;
     };
 
-    // Warm-up/compile only. Do not include it in sustained timing.
+    // Correctness step 0: frozen starting weights.  This validates forward,
+    // exact CE loss, backward probes, and global gradient norm.
+    markStage(out.backend+":stateful:step0:start");
     auto ec=net->runSessionWithCallBackInfo(session,before,after,true);
-    req(ec==NO_ERROR,"static warmup failed on "+out.backend);
-    Tensor lossHost(lo,Tensor::CAFFE); lo->copyToHostTensor(&lossHost);
-    out.firstLoss=lossHost.host<float>()[0];
+    req(ec==NO_ERROR,"stateful correctness step0 failed on "+out.backend);
+    markStage(out.backend+":stateful:step0:done");
 
-    auto t0=std::chrono::steady_clock::now();
-    for(int i=0;i<steps;++i) {
-        auto e=net->runSession(session);
-        req(e==NO_ERROR,"static training step failed on "+out.backend);
+    out.step0Loss=readScalar(lo,"loss");
+    out.step0GradNorm=readScalar(gn,"global_grad_norm");
+    out.step0LossAbs=std::abs(out.step0Loss-b.reference.loss);
+    out.step0GradNormRel=relerr(out.step0GradNorm,b.reference.globalGradNorm);
+
+    for(const auto& p:spec.probes) {
+        if(p.kind==StatefulProbeKind::ParameterAfterFirstUpdate) continue;
+        const double got=readScalar(
+            net->getSessionOutput(session,p.name.c_str()),p.name);
+        const double ae=std::abs(got-p.ref);
+        const double re=relerr(got,p.ref);
+        if(p.kind==StatefulProbeKind::Logit) {
+            out.maxStep0LogitAbs=std::max(out.maxStep0LogitAbs,ae);
+        } else if(p.kind==StatefulProbeKind::Gradient) {
+            if(ae>out.maxStep0GradAbs) {
+                out.maxStep0GradAbs=ae;
+                out.worstGradSlot=p.slot;
+                out.worstGradIndex=p.index;
+                out.worstGradRef=p.ref;
+                out.worstGradGot=got;
+            }
+            out.maxStep0GradRel=std::max(out.maxStep0GradRel,re);
+        }
     }
-    auto t1=std::chrono::steady_clock::now();
-    lo->copyToHostTensor(&lossHost);
-    out.lastLoss=lossHost.host<float>()[0];
-    out.seconds=std::chrono::duration<double>(t1-t0).count();
-    out.steps=steps;
-    out.tokps=(steps*S)/std::max(1e-9,out.seconds);
-    out.finite=std::isfinite(out.firstLoss)&&std::isfinite(out.lastLoss);
-    out.cpuOps=counts.cpu; out.gpuOps=counts.opencl; out.otherOps=counts.other;
 
-    // Persist the trained session atomically. MNN officially exposes this path.
-    auto ue=net->updateSessionToModel(session);
-    req(ue==NO_ERROR,"updateSessionToModel failed");
-    auto mb=net->getModelBuffer();
-    req(mb.first&&mb.second>0,"getModelBuffer returned empty model");
+    // Correctness step 1 runs on parameters that were updated by step 0.
+    // Parameter probes are read from CURRENT trainable state, so they directly
+    // validate the frozen PyTorch fresh-AdamW "after" values without mapping
+    // whole parameter tensors back to the CPU.
+    markStage(out.backend+":stateful:step1:start");
+    ec=net->runSession(session);
+    req(ec==NO_ERROR,"stateful correctness step1 failed on "+out.backend);
+    markStage(out.backend+":stateful:step1:done");
+
+    out.step1Loss=readScalar(lo,"loss");
+    out.step1GradNorm=readScalar(gn,"global_grad_norm");
+
+    for(const auto& p:spec.probes) {
+        if(p.kind!=StatefulProbeKind::ParameterAfterFirstUpdate) continue;
+        const double got=readScalar(
+            net->getSessionOutput(session,p.name.c_str()),p.name);
+        const double ae=std::abs(got-p.ref);
+        const double re=relerr(got,p.ref);
+        if(ae>out.maxStep1ParamAbs) {
+            out.maxStep1ParamAbs=ae;
+            out.worstParamSlot=p.slot;
+            out.worstParamIndex=p.index;
+            out.worstParamRef=p.ref;
+            out.worstParamGot=got;
+        }
+        out.maxStep1ParamRel=std::max(out.maxStep1ParamRel,re);
+    }
+
+    out.finite=
+        std::isfinite(out.step0Loss)&&
+        std::isfinite(out.step0GradNorm)&&
+        std::isfinite(out.step1Loss)&&
+        std::isfinite(out.step1GradNorm)&&
+        std::isfinite(out.maxStep0LogitAbs)&&
+        std::isfinite(out.maxStep0GradAbs)&&
+        std::isfinite(out.maxStep1ParamAbs);
+
+    const bool backendOk=!persistent||out.counts.opencl>0;
+    out.pass=
+        out.finite&&backendOk&&
+        out.step0LossAbs<=2e-3&&
+        out.maxStep0LogitAbs<=5e-3&&
+        out.step0GradNormRel<=2e-2&&
+        out.maxStep0GradAbs<=5e-3&&
+        out.maxStep1ParamAbs<=5e-4;
+
+    markStage(out.backend+":stateful:correctness:done");
+
+    if(!out.pass) {
+        if(!persistent) {
+            net->releaseSession(session);
+        } else {
+            // Keep the failed OpenCL Session alive too.  Destroying it is the
+            // exact vendor crash path under investigation.
+            markStage("OPENCL:stateful:persistent_after_parity_fail");
+        }
+        return out;
+    }
+
+    // Sustained timing continues on the SAME Session and state.  The two
+    // correctness steps above double as warm-up/compile and are excluded.
+    Tensor finalLossHost(lo,Tensor::CAFFE);
+    markStage(out.backend+":stateful:timed:start");
+    const auto t0=std::chrono::steady_clock::now();
+    for(int i=0;i<timedSteps;++i) {
+        ec=net->runSession(session);
+        req(ec==NO_ERROR,"stateful timed step failed on "+out.backend);
+    }
+    // OpenCL runSession may enqueue asynchronously.  Copy the final scalar
+    // BEFORE stopping the timer so the reported wall time includes all GPU
+    // execution instead of only queue submission.
+    lo->copyToHostTensor(&finalLossHost);
+    const auto t1=std::chrono::steady_clock::now();
+    markStage(out.backend+":stateful:timed:done");
+
+    auto* lp=finalLossHost.host<float>();
+    req(lp!=nullptr,"stateful final loss host read failed");
+    out.finalLoss=static_cast<double>(lp[0]);
+    out.timedSteps=timedSteps;
+    out.seconds=std::chrono::duration<double>(t1-t0).count();
+    out.tokps=(timedSteps*S)/std::max(1e-9,out.seconds);
+    out.finite=out.finite&&std::isfinite(out.finalLoss);
+
+    // Persist current trainable state without destroying the live OpenCL
+    // Session.  Reload verification is intentionally done on CPU; creating a
+    // second disposable OpenCL Session would re-enter the proven Mali teardown
+    // crash and is not needed to prove that the checkpoint artifact is valid.
+    markStage(out.backend+":stateful:checkpoint:start");
+    const auto ue=net->updateSessionToModel(session);
+    req(ue==NO_ERROR,"updateSessionToModel failed on "+out.backend);
+    const auto mb=net->getModelBuffer();
+    req(mb.first&&mb.second>0,"getModelBuffer returned empty model on "+out.backend);
+
     out.checkpointPath=workDir+"/gate-"+out.backend+".mnn";
     atomicWrite(out.checkpointPath,mb.first,mb.second);
+    out.checkpointReloadOk=verifyCheckpointOnCpu(b,out.checkpointPath);
+    req(out.checkpointReloadOk,"CPU reload verification failed for "+out.backend+" checkpoint");
+    markStage(out.backend+":stateful:checkpoint:done");
 
-    // Prove the persisted checkpoint is structurally reloadable, not merely writable.
-    {
-        std::shared_ptr<Interpreter> reloaded(
-            Interpreter::createFromFile(out.checkpointPath.c_str()), Interpreter::destroy);
-        req(reloaded!=nullptr,"checkpoint reload Interpreter failed on "+out.backend);
-        auto* rs=reloaded->createSession(cfg);
-        req(rs!=nullptr,"checkpoint reload session failed on "+out.backend);
-        auto* rti=reloaded->getSessionInput(rs,"tokens");
-        auto* ryi=reloaded->getSessionInput(rs,"targets");
-        auto* rlo=reloaded->getSessionOutput(rs,"loss");
-        req(rti&&ryi&&rlo,"checkpoint reload IO contract failed on "+out.backend);
-        reloaded->releaseSession(rs);
-        out.checkpointReloadOk=true;
+    if(persistent) {
+        gPersistentOpenCLLease->checkpointPath=out.checkpointPath;
+        markStage("OPENCL:stateful:persistent_lease:armed");
+        // Intentionally no releaseSession() and no Interpreter::destroy().
+    } else {
+        const bool released=net->releaseSession(session);
+        req(released,"CPU stateful releaseSession failed");
     }
 
-    net->releaseSession(session);
     return out;
 }
 
-Bench safeBenchStatic(const Bundle& b,const std::string& baseModel,const std::string& workDir,
-                     MNNForwardType type,int gpuMode,int steps) {
+StatefulRun safeRunStatefulStatic(
+    const Bundle& b,
+    const StaticTrainBuild& spec,
+    const std::string& workDir,
+    MNNForwardType type,
+    int gpuMode,
+    int timedSteps
+) {
     try {
-        return benchStatic(b,baseModel,workDir,type,gpuMode,steps);
+        return runStatefulStatic(b,spec,workDir,type,gpuMode,timedSteps);
     } catch(const std::exception& e) {
-        Bench out;
+        StatefulRun out;
         out.backend=typeName(type);
+        out.persistent=(type==MNN_FORWARD_OPENCL)&&gPersistentOpenCLLease!=nullptr;
         out.error=e.what();
         return out;
     }
 }
 
-std::string benchJson(const Bench& b) {
+std::string statefulJson(const StatefulRun& r) {
     std::ostringstream o;
-    o<<"{\"backend\":\""<<b.backend<<"\",\"available\":"<<(b.available?"true":"false")
-      <<",\"finite\":"<<(b.finite?"true":"false")<<",\"steps\":"<<b.steps
-      <<",\"first_loss\":"<<b.firstLoss<<",\"last_loss\":"<<b.lastLoss
-      <<",\"seconds\":"<<b.seconds<<",\"target_tokens_per_second\":"<<b.tokps
-      <<",\"profile\":{\"cpu_backend_hits\":"<<b.cpuOps<<",\"gpu_backend_hits\":"<<b.gpuOps
-      <<",\"other_backend_hits\":"<<b.otherOps<<"},\"checkpoint\":\""<<jsonEscape(b.checkpointPath)<<"\""
-      <<",\"checkpoint_reload_ok\":"<<(b.checkpointReloadOk?"true":"false")
-      <<",\"error\":\""<<jsonEscape(b.error)<<"\"}";
+    o<<"{\"backend\":\""<<r.backend<<"\""
+     <<",\"available\":"<<(r.available?"true":"false")
+     <<",\"finite\":"<<(r.finite?"true":"false")
+     <<",\"pass\":"<<(r.pass?"true":"false")
+     <<",\"persistent\":"<<(r.persistent?"true":"false")
+     <<",\"session_memory_mb\":"<<r.sessionMemoryMb
+     <<",\"step0\":{\"loss\":"<<r.step0Loss
+     <<",\"loss_abs_error\":"<<r.step0LossAbs
+     <<",\"global_grad_norm\":"<<r.step0GradNorm
+     <<",\"grad_norm_rel_error\":"<<r.step0GradNormRel
+     <<",\"max_logit_abs_error\":"<<r.maxStep0LogitAbs
+     <<",\"max_grad_probe_abs_error\":"<<r.maxStep0GradAbs
+     <<",\"max_grad_probe_rel_error\":"<<r.maxStep0GradRel<<"}"
+     <<",\"step1\":{\"loss\":"<<r.step1Loss
+     <<",\"global_grad_norm\":"<<r.step1GradNorm
+     <<",\"max_parameter_after_adamw_abs_error\":"<<r.maxStep1ParamAbs
+     <<",\"max_parameter_after_adamw_rel_error\":"<<r.maxStep1ParamRel<<"}"
+     <<",\"worst_grad\":{\"slot\":\""<<jsonEscape(r.worstGradSlot)
+     <<"\",\"index\":"<<r.worstGradIndex
+     <<",\"ref\":"<<r.worstGradRef<<",\"got\":"<<r.worstGradGot<<"}"
+     <<",\"worst_parameter_after_adamw\":{\"slot\":\""<<jsonEscape(r.worstParamSlot)
+     <<"\",\"index\":"<<r.worstParamIndex
+     <<",\"ref\":"<<r.worstParamRef<<",\"got\":"<<r.worstParamGot<<"}"
+     <<",\"timed\":{\"steps\":"<<r.timedSteps
+     <<",\"final_loss\":"<<r.finalLoss
+     <<",\"seconds\":"<<r.seconds
+     <<",\"target_tokens_per_second\":"<<r.tokps<<"}"
+     <<",\"backend_counts\":{\"cpu\":"<<r.counts.cpu
+     <<",\"opencl\":"<<r.counts.opencl
+     <<",\"vulkan\":"<<r.counts.vulkan
+     <<",\"other\":"<<r.counts.other
+     <<",\"callbacks\":"<<r.counts.callbacks<<"}"
+     <<",\"checkpoint\":\""<<jsonEscape(r.checkpointPath)<<"\""
+     <<",\"checkpoint_reload_on_cpu_ok\":"<<(r.checkpointReloadOk?"true":"false")
+     <<",\"error\":\""<<jsonEscape(r.error)<<"\"}";
     return o.str();
 }
 
@@ -1203,6 +1598,14 @@ std::string validateBundleJson(const std::string& dir) {
 std::string runModel0001GateJson(const std::string& dir,const std::string& workDir,float thermalHeadroom) {
     gStagePath=workDir+"/last_native_stage.txt";
     markStage("run:enter");
+    if(!gPersistentOpenCLReport.empty()) {
+        markStage("run:reuse_completed_persistent_report");
+        return gPersistentOpenCLReport;
+    }
+    if(gPersistentOpenCLLease!=nullptr) {
+        markStage("run:refuse_rerun_persistent_opencl_session");
+        return "{\"status\":\"REFUSE_RERUN_PERSISTENT_OPENCL_SESSION\",\"error\":\"An OpenCL Session already exists in this app process. It is intentionally not destroyed because this Mali driver crashes in clReleaseKernel. Force-stop/reopen the app before requesting a fresh gate.\"}";
+    }
     try {
         auto b=Bundle::load(dir);
         markStage("run:bundle_loaded");
@@ -1256,73 +1659,66 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         vk.pass=false;
         vk.error="disabled_by_project_policy";
 
-        // 3) Serialize a read-only one-step parity graph with ONLY compact
-        // outputs: loss, global grad norm, the locked logit probes, the locked
-        // gradient probes, and the locked fresh-state AdamW probes. This checks
-        // the same semantics as CPU dynamic parity without copying 74 complete
-        // gradients back from GPU.
-        const std::string parityModel=workDir+"/model0001-gate-static-parity.mnn";
-        markStage("run:static_parity_build:start");
-        auto paritySpec=buildStaticParityModel(b,parityModel);
-        markStage("run:static_parity_build:done");
+        // 3) Build ONE stateful static AdamW graph.  CPU and OpenCL run the
+        // exact same serialized graph.  For OpenCL, correctness and sustained
+        // timing use the SAME Session and the Session is intentionally kept
+        // alive for the rest of the Android process.  The device tombstones
+        // prove that per-gate OpenCL teardown is the crash, not computation.
+        const std::string base=workDir+"/model0001-gate-stateful.mnn";
+        markStage("run:stateful_build:start");
+        auto statefulSpec=buildStaticAdamWModel(b,base);
+        markStage("run:stateful_build:done");
 
-        markStage("run:cpu_static_parity:start");
-        auto cpuStatic=safeStaticParity(b,paritySpec,MNN_FORWARD_CPU,0);
-        markStage("run:cpu_static_parity:done");
-        if(!cpuStatic.pass) {
-            return std::string("{\"status\":\"FAIL_CPU_STATIC_PARITY\",\"thermal_headroom_start\":")+
+        const int steps=20;
+
+        markStage("run:cpu_stateful:start");
+        auto cpuStateful=safeRunStatefulStatic(
+            b,statefulSpec,workDir,MNN_FORWARD_CPU,0,steps);
+        markStage("run:cpu_stateful:done");
+        if(!(cpuStateful.pass&&cpuStateful.finite&&cpuStateful.checkpointReloadOk)) {
+            return std::string("{\"status\":\"FAIL_CPU_STATEFUL_GATE\",\"thermal_headroom_start\":")+
                 std::to_string(thermalHeadroom)+
                 ",\"cpu_dynamic\":"+parityJson(cpu)+
-                ",\"cpu_static\":"+staticParityJson(cpuStatic)+"}";
+                ",\"cpu_stateful\":"+statefulJson(cpuStateful)+"}";
         }
 
-        markStage("run:opencl_static_parity:start");
-        auto clStatic=safeStaticParity(
-            b,paritySpec,MNN_FORWARD_OPENCL,
-            MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
-        markStage("run:opencl_static_parity:done");
-        if(!clStatic.pass) {
-            return std::string("{\"status\":\"FAIL_OPENCL_STATIC_PARITY\",\"thermal_headroom_start\":")+
+        markStage("run:opencl_stateful:start");
+        auto clStateful=safeRunStatefulStatic(
+            b,statefulSpec,workDir,MNN_FORWARD_OPENCL,
+            MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE,steps);
+        markStage("run:opencl_stateful:returned");
+
+        if(!clStateful.pass) {
+            return std::string("{\"status\":\"FAIL_OPENCL_STATEFUL_PARITY\",\"thermal_headroom_start\":")+
                 std::to_string(thermalHeadroom)+
                 ",\"cpu_dynamic\":"+parityJson(cpu)+
-                ",\"cpu_static\":"+staticParityJson(cpuStatic)+
-                ",\"opencl_static\":"+staticParityJson(clStatic)+
+                ",\"cpu_stateful\":"+statefulJson(cpuStateful)+
+                ",\"opencl_stateful\":"+statefulJson(clStateful)+
+                ",\"opencl_runtime\":"+openClProbe()+
+                ",\"note\":\"OpenCL Session remains process-persistent; restart the app before rerunning the gate.\"}";
+        }
+        if(!(clStateful.finite&&clStateful.checkpointReloadOk&&clStateful.counts.opencl>0)) {
+            return std::string("{\"status\":\"FAIL_OPENCL_STATEFUL_TRAIN\",\"thermal_headroom_start\":")+
+                std::to_string(thermalHeadroom)+
+                ",\"cpu_dynamic\":"+parityJson(cpu)+
+                ",\"cpu_stateful\":"+statefulJson(cpuStateful)+
+                ",\"opencl_stateful\":"+statefulJson(clStateful)+
                 ",\"opencl_runtime\":"+openClProbe()+"}";
         }
 
-        // 4) Only after exact static OpenCL parity passes, build the stateful
-        // AdamW loop and measure sustained CPU vs OpenCL training. This graph
-        // is backend-neutral and each Session gets its own independent state.
-        const std::string base=workDir+"/model0001-gate-static-base.mnn";
-        markStage("run:static_train_build:start");
-        buildStaticAdamWModel(b,base);
-        markStage("run:static_train_build:done");
-
-        const int steps=20;
-        markStage("run:cpu_static_train:start");
-        Bench bc=benchStatic(b,base,workDir,MNN_FORWARD_CPU,0,steps);
-        markStage("run:cpu_static_train:done");
-        req(bc.available&&bc.finite&&bc.checkpointReloadOk,
-            "CPU static training/checkpoint reference failed");
-
-        markStage("run:opencl_static_train:start");
-        Bench bg=safeBenchStatic(
-            b,base,workDir,MNN_FORWARD_OPENCL,
-            MNN_GPU_TUNING_NORMAL|MNN_GPU_MEMORY_IMAGE,steps);
-        markStage("run:opencl_static_train:done");
-
-        Bench bv;
+        StatefulRun bv;
         bv.backend="VULKAN";
         bv.error="disabled_by_project_policy";
 
-        const double cpuT=bc.tokps;
-        const double clRatio=(cpuT>0&&bg.tokps>0)?bg.tokps/cpuT:0.0;
+        const double cpuT=cpuStateful.tokps;
+        const double clRatio=(cpuT>0&&clStateful.tokps>0)?clStateful.tokps/cpuT:0.0;
         const double vkRatio=0.0;
 
         // A training backend is accepted only after static correctness has
         // passed. Speed alone can never promote it.
         const bool clTrainOk=
-            bg.available&&bg.finite&&bg.checkpointReloadOk&&bg.gpuOps>0;
+            clStateful.available&&clStateful.finite&&clStateful.pass&&
+            clStateful.checkpointReloadOk&&clStateful.counts.opencl>0;
         const bool clUseful=clTrainOk&&clRatio>=1.5;
         const bool clCanonical=clTrainOk&&clRatio>=2.0;
         const bool vkUseful=false;
@@ -1332,7 +1728,7 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         if(clCanonical){winner="OPENCL";}
 
         std::ostringstream o;
-        o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v2\""
+        o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v3\""
          <<",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT<<"\""
          <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
          <<",\"model_state_sha256\":\""<<b.modelStateSha256<<"\""
@@ -1341,11 +1737,9 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
          <<",\"opencl_runtime\":"<<openClProbe()
          <<",\"dynamic_parity\":{\"cpu\":"<<parityJson(cpu)
          <<",\"opencl\":"<<parityJson(clDynamic)<<"}"
-         <<",\"static_parity\":{\"cpu\":"<<staticParityJson(cpuStatic)
-         <<",\"opencl\":"<<staticParityJson(clStatic)<<"}"
-         <<",\"static_train\":{\"cpu\":"<<benchJson(bc)
-         <<",\"opencl\":"<<benchJson(bg)
-         <<",\"vulkan_buffer\":"<<benchJson(bv)<<"}"
+         <<",\"stateful_static\":{\"cpu\":"<<statefulJson(cpuStateful)
+         <<",\"opencl\":"<<statefulJson(clStateful)
+         <<",\"vulkan_buffer\":"<<statefulJson(bv)<<"}"
          <<",\"speed_ratio\":{\"opencl_vs_cpu\":"<<clRatio
          <<",\"vulkan_vs_cpu\":"<<vkRatio<<"}"
          <<",\"useful_1_5x\":{\"opencl\":"<<(clUseful?"true":"false")
@@ -1353,9 +1747,12 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
          <<",\"canonical_2x\":{\"opencl\":"<<(clCanonical?"true":"false")
          <<",\"vulkan_buffer\":"<<(vkCanonical?"true":"false")<<"}"
          <<",\"recommended_backend\":\""<<winner<<"\""
-         <<",\"note\":\"GPU correctness is validated through a memory-planned static FP32 graph exposing only locked scalar probes; dynamic OpenCL full-gradient host materialization is intentionally excluded after an Android LOW_MEMORY kill. Backend switch remains stage-boundary only.\"}";
-        markStage("run:success");
-        return o.str();
+         <<",\"opencl_lifetime\":\"process_persistent_session\""
+         <<",\"note\":\"One stateful FP32 graph is used for CPU/OpenCL correctness and sustained timing. OpenCL correctness validates loss/logits/backward/global-grad-norm on step 0 and direct compact parameter values after the first AdamW update on step 1. The same OpenCL Session then continues for the timed steps and is intentionally not destroyed because device tombstones prove Mali-G610 SIGSEGVs in clReleaseKernel during MNN 3.6.1 Session teardown even after clFinish(). Backend promotion remains stage-boundary only.\"}";
+        const auto report=o.str();
+        gPersistentOpenCLReport=report;
+        markStage("run:success:persistent_opencl_session");
+        return report;
     } catch(const std::exception& e) {
         return std::string("{\"status\":\"FAIL\",\"error\":\"")+jsonEscape(e.what())+"\"}";
     }
