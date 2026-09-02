@@ -2529,8 +2529,14 @@ std::string NativeTrainer::profileKernelsJson() {
         runtime_.finish();
         resetToSourceState();
 
+        // Build the exact forward activations and dLogits first without
+        // collecting events. Capture only backward() so the kernel ranking
+        // answers the already-proven 66.8% backward bottleneck specifically.
+        forward();
+        runtime_.finish();
+
         runtime_.beginKernelCapture();
-        fullTrainingStep();
+        backward();
         const auto totals = runtime_.endKernelCapture();
         runtime_.endDiagnosticQueue();
 
@@ -2555,7 +2561,8 @@ std::string NativeTrainer::profileKernelsJson() {
             << ",\"diagnostic_only\":true"
             << ",\"used_for_acceptance\":false"
             << ",\"queue_profiling_enabled\":true"
-            << ",\"profiled_full_steps\":1"
+            << ",\"profiled_backward_passes\":1"
+            << ",\"forward_prerun_profiled\":false"
             << ",\"event_count\":" << totalEvents
             << ",\"total_kernel_seconds\":" << totalKernelSeconds
             << ",\"kernels\":[";
