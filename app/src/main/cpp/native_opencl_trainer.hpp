@@ -33,6 +33,19 @@ NativePilotResult runNativeModel0001LrPilot(
     const std::string& pilotRoot,
     const std::string& workDir);
 
+struct NativeStageResult {
+    bool pass = false;
+    std::string json;
+};
+
+// Runs or resumes the recipe-driven Foundation-v3 production stage.
+// The stage package is data+recipe only; source weights come from the same
+// immutable CPT-v2 .atb bundle used by the accepted GPU gate.
+NativeStageResult runNativeModel0001Stage(
+    const Bundle& bundle,
+    const std::string& stageRoot,
+    const std::string& workDir);
+
 std::string probeNativeOpenClJson();
 
 }  // namespace at

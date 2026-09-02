@@ -41,6 +41,8 @@ public final class MainActivity extends Activity {
     private static final int REQ_REPORT = 1002;
     private static final int REQ_CRASH_TRACE = 1003;
     private static final int REQ_PILOT = 1004;
+    private static final int REQ_STAGE = 1005;
+    private static final int REQ_CHECKPOINT_EXPORT = 1006;
 
     static {
         System.loadLibrary("android_trainer");
@@ -49,8 +51,13 @@ public final class MainActivity extends Activity {
     private TextView log;
     private Button run;
     private Button pilotRun;
+    private Button productionRun;
+    private Button exportCheckpoint;
     private File bundleDir;
     private File pilotDir;
+    private File stageDir;
+    private File lastTrainingCheckpoint;
+    private volatile boolean trainingActive = false;
     private String lastReport = "";
     private File lastNativeTrace;
     private PowerManager powerManager;
@@ -60,6 +67,7 @@ public final class MainActivity extends Activity {
     private static native String nativeValidateBundle(String bundleDir);
     private static native String nativeRunGate(String bundleDir, String workDir, float thermalHeadroom);
     private static native String nativeRunLrPilot(String bundleDir, String pilotDir, String workDir);
+    private static native String nativeRunStage(String bundleDir, String stageDir, String workDir);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -115,6 +123,20 @@ public final class MainActivity extends Activity {
         pilotRun.setOnClickListener(v -> runLrPilot());
         buttons.addView(pilotRun);
 
+        Button selectStage = button("7. Import locked Foundation-v3 .atstage");
+        selectStage.setOnClickListener(v -> selectStage());
+        buttons.addView(selectStage);
+
+        productionRun = button("8. Run / resume Foundation-v3 training");
+        productionRun.setEnabled(false);
+        productionRun.setOnClickListener(v -> runProductionStage());
+        buttons.addView(productionRun);
+
+        exportCheckpoint = button("9. Export final native checkpoint");
+        exportCheckpoint.setEnabled(false);
+        exportCheckpoint.setOnClickListener(v -> exportTrainingCheckpoint());
+        buttons.addView(exportCheckpoint);
+
         Button export = button("Export last JSON report");
         export.setOnClickListener(v -> exportReport());
         buttons.addView(export);
@@ -138,6 +160,7 @@ public final class MainActivity extends Activity {
         root.addView(scroller, new LinearLayout.LayoutParams(-1, 0, 1f));
         setContentView(root);
         showPreviousExitDiagnostics();
+        restoreExistingPackages();
         handleLaunchIntent(getIntent());
     }
 
@@ -303,8 +326,11 @@ public final class MainActivity extends Activity {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         if (requestCode == REQ_BUNDLE) importBundle(data.getData());
         if (requestCode == REQ_PILOT) importPilot(data.getData());
+        if (requestCode == REQ_STAGE) importStage(data.getData());
         if (requestCode == REQ_REPORT) writeReport(data.getData());
         if (requestCode == REQ_CRASH_TRACE) writeNativeTrace(data.getData());
+        if (requestCode == REQ_CHECKPOINT_EXPORT)
+            writeTrainingCheckpoint(data.getData());
     }
 
     private void importBundle(Uri uri) {
@@ -340,6 +366,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     run.setEnabled(true);
                     updatePilotEnabled();
+                    updateProductionEnabled();
                     if (runAfterImport) runGate();
                 });
             } catch (Throwable t) {
@@ -425,6 +452,146 @@ public final class MainActivity extends Activity {
     private void updatePilotEnabled() {
         if (pilotRun != null)
             pilotRun.setEnabled(bundleDir != null && pilotDir != null);
+    }
+
+
+    private void selectStage() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_MIME_TYPES,
+                new String[]{"application/zip", "application/octet-stream"});
+        startActivityForResult(i, REQ_STAGE);
+    }
+
+    private void importStage(Uri uri) {
+        append("\n=== IMPORT FOUNDATION-v3 PRODUCTION STAGE ===");
+        if (productionRun != null) productionRun.setEnabled(false);
+        new Thread(() -> {
+            try {
+                File zip =
+                        new File(getFilesDir(), "model0001-foundation-v3.atstage");
+                try (InputStream in = getContentResolver().openInputStream(uri);
+                     OutputStream out =
+                             new BufferedOutputStream(new FileOutputStream(zip))) {
+                    if (in == null)
+                        throw new IllegalStateException(
+                                "content resolver returned null stage stream");
+                    copy(in, out);
+                }
+                String stageSha = sha256(zip);
+                File dest = new File(getFilesDir(), "production_stage");
+                deleteTree(dest);
+                if (!dest.mkdirs() && !dest.isDirectory())
+                    throw new IllegalStateException("cannot create stage dir");
+                unzipSafely(zip, dest);
+                verifyStageFiles(dest);
+                stageDir = dest;
+                append("stage_package_sha256: " + stageSha);
+                append("production stage verification: PASS");
+                runOnUiThread(this::updateProductionEnabled);
+            } catch (Throwable t) {
+                append("STAGE IMPORT FAIL: " + t);
+            }
+        }, "android-trainer-stage-import").start();
+    }
+
+    private void verifyStageFiles(File root) throws Exception {
+        File manifestFile = new File(root, "manifest.json");
+        if (!manifestFile.isFile())
+            throw new IllegalStateException("stage manifest.json missing");
+        String text = new String(
+                java.nio.file.Files.readAllBytes(manifestFile.toPath()),
+                java.nio.charset.StandardCharsets.UTF_8);
+        JSONObject manifest = new JSONObject(text);
+        if (!"model0001_native_stage_package_v2".equals(
+                manifest.getString("schema")))
+            throw new IllegalStateException("wrong stage schema");
+        if (!"047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d"
+                .equals(manifest.getString("source_model_state_sha256")))
+            throw new IllegalStateException("stage source-model SHA mismatch");
+        JSONObject guards = manifest.getJSONObject("hard_guards");
+        if (guards.getBoolean("test_split_packaged"))
+            throw new IllegalStateException("stage contains test split");
+        if (guards.getBoolean("dataset_v2_train_bin_packaged"))
+            throw new IllegalStateException("stage contains Dataset-v2 train");
+
+        JSONObject recipe = manifest.getJSONObject("recipe");
+        if (!"friend_foundation_v3_cpt".equals(recipe.getString("stage_name")))
+            throw new IllegalStateException("stage-name drift");
+        if (recipe.getBoolean("test_split_used"))
+            throw new IllegalStateException("recipe touches test split");
+        if (!"fresh_zero_moments".equals(recipe.getString("optimizer_init")))
+            throw new IllegalStateException("stage optimizer-init drift");
+
+        JSONObject data = manifest.getJSONObject("data");
+        String[] keys =
+                new String[]{"train", "v3_validation", "v1_validation"};
+        for (String key : keys) {
+            JSONObject spec = data.getJSONObject(key);
+            File file = canonicalChild(root, spec.getString("path"));
+            if (!file.isFile())
+                throw new IllegalStateException("stage data missing: " + key);
+            long expectedBytes = spec.getLong("uint16_tokens") * 2L;
+            if (file.length() != expectedBytes)
+                throw new IllegalStateException(
+                        "stage data size mismatch: " + key);
+            if (!sha256(file).equalsIgnoreCase(spec.getString("sha256")))
+                throw new IllegalStateException(
+                        "stage data SHA mismatch: " + key);
+        }
+    }
+
+    private void updateProductionEnabled() {
+        if (productionRun != null)
+            productionRun.setEnabled(
+                    bundleDir != null && stageDir != null && !trainingActive);
+    }
+
+    private void restoreExistingPackages() {
+        new Thread(() -> {
+            try {
+                File existingBundle = new File(getFilesDir(), "gate_bundle");
+                if (existingBundle.isDirectory()) {
+                    verifyBundleFiles(existingBundle);
+                    String check =
+                            nativeValidateBundle(existingBundle.getAbsolutePath());
+                    if ("PASS".equals(
+                            new JSONObject(check).optString("status"))) {
+                        bundleDir = existingBundle;
+                        append("restored canonical .atb bundle");
+                    }
+                }
+            } catch (Throwable t) {
+                append("existing bundle restore skipped: " + t);
+            }
+            try {
+                File existingPilot = new File(getFilesDir(), "pilot_bundle");
+                if (existingPilot.isDirectory()) {
+                    verifyPilotFiles(existingPilot);
+                    pilotDir = existingPilot;
+                    append("restored LR pilot package");
+                }
+            } catch (Throwable t) {
+                append("existing pilot restore skipped: " + t);
+            }
+            try {
+                File existingStage =
+                        new File(getFilesDir(), "production_stage");
+                if (existingStage.isDirectory()) {
+                    verifyStageFiles(existingStage);
+                    stageDir = existingStage;
+                    append("restored production stage package");
+                }
+            } catch (Throwable t) {
+                append("existing stage restore skipped: " + t);
+            }
+            runOnUiThread(() -> {
+                if (run != null) run.setEnabled(bundleDir != null);
+                updatePilotEnabled();
+                updateProductionEnabled();
+            });
+        }, "android-trainer-restore").start();
     }
 
     private void verifyBundleFiles(File root) throws Exception {
@@ -571,6 +738,177 @@ public final class MainActivity extends Activity {
         }, "android-trainer-v3-lr-pilot").start();
     }
 
+
+    private void runProductionStage() {
+        if (bundleDir == null || stageDir == null || trainingActive) return;
+        append("\n=== FOUNDATION-v3 PRODUCTION TRAINING ===");
+        trainingActive = true;
+        run.setEnabled(false);
+        pilotRun.setEnabled(false);
+        productionRun.setEnabled(false);
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                ActivityManager am =
+                        (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                if (am != null)
+                    am.setProcessStateSummary(
+                            "model0001-foundation-v3-training".getBytes(
+                                    java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Throwable ignored) {}
+        }
+
+        startProgressWatcher();
+
+        new Thread(() -> {
+            PowerManager.WakeLock wl = null;
+            try {
+                wl = powerManager.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "AndroidTrainer:FoundationV3");
+                wl.acquire(6L * 60L * 60L * 1000L);
+                float thermalStart = thermalHeadroom();
+                long startNs = android.os.SystemClock.elapsedRealtimeNanos();
+                String out = nativeRunStage(
+                        bundleDir.getAbsolutePath(),
+                        stageDir.getAbsolutePath(),
+                        getFilesDir().getAbsolutePath());
+                float thermalEnd = thermalHeadroom();
+                double seconds =
+                        (android.os.SystemClock.elapsedRealtimeNanos() - startNs)
+                                / 1.0e9;
+                try {
+                    JSONObject reportObj = new JSONObject(out);
+                    reportObj.put(
+                            "thermal_headroom_start",
+                            Float.isNaN(thermalStart)
+                                    ? JSONObject.NULL : thermalStart);
+                    reportObj.put(
+                            "thermal_headroom_end",
+                            Float.isNaN(thermalEnd)
+                                    ? JSONObject.NULL : thermalEnd);
+                    reportObj.put("app_stage_wall_seconds", seconds);
+                    JSONObject checkpoint =
+                            reportObj.optJSONObject("checkpoint");
+                    if (checkpoint != null) {
+                        String path = checkpoint.optString("path", "");
+                        if (!path.isEmpty()) {
+                            File file = new File(path);
+                            if (file.isFile()) lastTrainingCheckpoint = file;
+                        }
+                    }
+                    out = reportObj.toString();
+                } catch (Exception ignored) {}
+                lastReport = out;
+                File report =
+                        new File(getFilesDir(), "last_production_stage_report.json");
+                try (FileOutputStream os = new FileOutputStream(report)) {
+                    os.write(out.getBytes(
+                            java.nio.charset.StandardCharsets.UTF_8));
+                    os.getFD().sync();
+                }
+                publishReport(out);
+                append(pretty(out));
+            } catch (Throwable t) {
+                append("PRODUCTION TRAINING FAIL: " + t);
+            } finally {
+                trainingActive = false;
+                if (wl != null && wl.isHeld()) wl.release();
+                runOnUiThread(() -> {
+                    run.setEnabled(bundleDir != null);
+                    updatePilotEnabled();
+                    updateProductionEnabled();
+                    if (exportCheckpoint != null)
+                        exportCheckpoint.setEnabled(
+                                lastTrainingCheckpoint != null &&
+                                lastTrainingCheckpoint.isFile());
+                });
+            }
+        }, "android-trainer-foundation-v3").start();
+    }
+
+    private void startProgressWatcher() {
+        new Thread(() -> {
+            String previous = "";
+            File progress =
+                    new File(getFilesDir(), "model0001-production-progress.json");
+            while (trainingActive) {
+                try {
+                    if (progress.isFile()) {
+                        String raw = new String(
+                                java.nio.file.Files.readAllBytes(
+                                        progress.toPath()),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        if (!raw.equals(previous)) {
+                            previous = raw;
+                            JSONObject p = new JSONObject(raw);
+                            int step = p.optInt("optimizer_step", 0);
+                            int total = p.optInt("total_updates", 0);
+                            double lr = p.optDouble("learning_rate", Double.NaN);
+                            Object loss = p.opt("last_train_loss");
+                            Object v3 = p.opt("latest_v3_validation_ce");
+                            Object v1 = p.opt("latest_v1_validation_ce");
+                            append(String.format(
+                                    Locale.ROOT,
+                                    "TRAIN %d/%d  %.2f%%  lr=%.3g  loss=%s  v3=%s  v1=%s",
+                                    step, total,
+                                    total > 0 ? 100.0 * step / total : 0.0,
+                                    lr,
+                                    String.valueOf(loss),
+                                    String.valueOf(v3),
+                                    String.valueOf(v1)));
+                        }
+                    }
+                    Thread.sleep(10000L);
+                } catch (InterruptedException e) {
+                    return;
+                } catch (Throwable t) {
+                    append("progress watcher: " + t);
+                    try { Thread.sleep(10000L); }
+                    catch (InterruptedException e) { return; }
+                }
+            }
+        }, "android-trainer-progress-watch").start();
+    }
+
+    private void exportTrainingCheckpoint() {
+        if (lastTrainingCheckpoint == null ||
+                !lastTrainingCheckpoint.isFile()) {
+            Toast.makeText(
+                    this, "No final checkpoint yet", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/octet-stream");
+        i.putExtra(
+                Intent.EXTRA_TITLE,
+                "model0001-foundation-v3-final.atnckpt");
+        startActivityForResult(i, REQ_CHECKPOINT_EXPORT);
+    }
+
+    private void writeTrainingCheckpoint(Uri uri) {
+        if (lastTrainingCheckpoint == null ||
+                !lastTrainingCheckpoint.isFile()) {
+            append("CHECKPOINT EXPORT FAIL: no final checkpoint");
+            return;
+        }
+        try (InputStream in =
+                     new BufferedInputStream(
+                             new FileInputStream(lastTrainingCheckpoint));
+             OutputStream out =
+                     new BufferedOutputStream(
+                             getContentResolver().openOutputStream(uri, "w"))) {
+            if (out == null)
+                throw new IllegalStateException(
+                        "null checkpoint output stream");
+            copy(in, out);
+            Toast.makeText(
+                    this, "Checkpoint exported", Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            append("CHECKPOINT EXPORT FAIL: " + t);
+        }
+    }
+
     private float thermalHeadroom() {
         if (Build.VERSION.SDK_INT >= 29) {
             try { return powerManager.getThermalHeadroom(0); }
@@ -588,6 +926,9 @@ public final class MainActivity extends Activity {
             if ("model0001_v3_lr_pilot_report_v1".equals(
                     reportObj.optString("schema"))) {
                 reportPrefix = "model0001-v3-lr-pilot-";
+            } else if ("model0001_native_stage_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                reportPrefix = "model0001-foundation-v3-stage-";
             }
         } catch (Exception ignored) {}
         values.put(MediaStore.MediaColumns.DISPLAY_NAME,
@@ -626,6 +967,9 @@ public final class MainActivity extends Activity {
             if ("model0001_v3_lr_pilot_report_v1".equals(
                     reportObj.optString("schema"))) {
                 title = "model0001-v3-lr-pilot-report.json";
+            } else if ("model0001_native_stage_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                title = "model0001-foundation-v3-stage-report.json";
             }
         } catch (Exception ignored) {}
         i.putExtra(Intent.EXTRA_TITLE, title);
