@@ -1394,6 +1394,7 @@ public:
     }
 
     NativeGateResult run(const std::function<double()>& cpuBaseline);
+    NativePilotResult runPilot(const PilotPackageData& pilot);
     const std::string& currentStage() const { return currentStage_; }
 
 private:
@@ -1541,6 +1542,11 @@ private:
     void computeGlobalNorm();
     void adamStep();
     void fullTrainingStep();
+    float readLoss();
+    float readGlobalNorm();
+    void setWindowFromU16(const PilotDataFile& data, int windowIndex);
+    double evaluateCe(
+        const PilotDataFile& data, const std::vector<int>& indices);
 
     std::vector<float> gather(cl_mem source, const std::vector<int>& indices);
     ForwardGate checkForward();
