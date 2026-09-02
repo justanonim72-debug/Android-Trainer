@@ -3964,4 +3964,30 @@ NativePilotResult runNativeModel0001LrPilot(
     return cached;
 }
 
+
+NativeStageResult runNativeModel0001Stage(
+    const Bundle& bundle,
+    const std::string& stageRoot,
+    const std::string& workDir) {
+    NativeTrainer* trainer = nullptr;
+    try {
+        const StagePackageData stage = loadStagePackage(stageRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        return trainer->runStage(stage);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_native_stage_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(trainer ? trainer->currentStage()
+                                  : "native:production:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":true"
+            << ",\"test_split_used\":false,\"pass\":false}";
+        return NativeStageResult{false, out.str()};
+    }
+}
+
 }  // namespace at
