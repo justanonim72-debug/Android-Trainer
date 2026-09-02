@@ -165,6 +165,7 @@ __kernel void rmsnorm_dw(
 }
 
 // C[M,N] = A[M,K] * W[N,K]^T.
+__attribute__((reqd_work_group_size(8, 8, 1)))
 __kernel void linear_forward(
     __global const float* a,
     __global const float* w,
@@ -174,22 +175,61 @@ __kernel void linear_forward(
     int n) {
     __local float aa[TILE][TILE];
     __local float ww[TILE][TILE];
-    int lx = (int)get_local_id(0), ly = (int)get_local_id(1);
-    int nn = (int)get_global_id(0), mm = (int)get_global_id(1);
-    float acc = 0.0f;
+
+    const int lx = (int)get_local_id(0);
+    const int ly = (int)get_local_id(1);
+    const int tx = lx * 2;
+    const int ty = ly * 2;
+    const int n0 = (int)get_group_id(0) * TILE + tx;
+    const int n1 = n0 + 1;
+    const int m0 = (int)get_group_id(1) * TILE + ty;
+    const int m1 = m0 + 1;
+
+    float acc00 = 0.0f, acc01 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f;
+
     for (int t = 0; t < k; t += TILE) {
-        int ak = t + lx;
-        int wk = t + ly;
-        aa[ly][lx] = (mm < m && ak < k) ? a[mm * k + ak] : 0.0f;
-        // ww needs the work-group's output-column base. get_group_id(0) is
-        // uniform across the work-group.
-        int tileN = (int)get_group_id(0) * TILE + lx;
-        ww[ly][lx] = (tileN < n && wk < k) ? w[tileN * k + wk] : 0.0f;
+        const int kx0 = t + tx;
+        const int kx1 = kx0 + 1;
+        const int ky0 = t + ty;
+        const int ky1 = ky0 + 1;
+
+        aa[ty][tx] =
+            (m0 < m && kx0 < k) ? a[m0 * k + kx0] : 0.0f;
+        aa[ty][tx + 1] =
+            (m0 < m && kx1 < k) ? a[m0 * k + kx1] : 0.0f;
+        aa[ty + 1][tx] =
+            (m1 < m && kx0 < k) ? a[m1 * k + kx0] : 0.0f;
+        aa[ty + 1][tx + 1] =
+            (m1 < m && kx1 < k) ? a[m1 * k + kx1] : 0.0f;
+
+        ww[ty][tx] =
+            (n0 < n && ky0 < k) ? w[n0 * k + ky0] : 0.0f;
+        ww[ty][tx + 1] =
+            (n1 < n && ky0 < k) ? w[n1 * k + ky0] : 0.0f;
+        ww[ty + 1][tx] =
+            (n0 < n && ky1 < k) ? w[n0 * k + ky1] : 0.0f;
+        ww[ty + 1][tx + 1] =
+            (n1 < n && ky1 < k) ? w[n1 * k + ky1] : 0.0f;
+
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (int q = 0; q < TILE; ++q) acc += aa[ly][q] * ww[q][lx];
+        for (int q = 0; q < TILE; ++q) {
+            const float a0 = aa[ty][q];
+            const float a1 = aa[ty + 1][q];
+            const float w0 = ww[q][tx];
+            const float w1 = ww[q][tx + 1];
+            acc00 += a0 * w0;
+            acc01 += a0 * w1;
+            acc10 += a1 * w0;
+            acc11 += a1 * w1;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (mm < m && nn < n) c[mm * n + nn] = acc;
+
+    if (m0 < m && n0 < n) c[m0 * n + n0] = acc00;
+    if (m0 < m && n1 < n) c[m0 * n + n1] = acc01;
+    if (m1 < m && n0 < n) c[m1 * n + n0] = acc10;
+    if (m1 < m && n1 < n) c[m1 * n + n1] = acc11;
 }
 
 // DX[M,K] = DY[M,N] * W[N,K].
@@ -1603,7 +1643,7 @@ void NativeTrainer::linearForward(
     runtime_.argument(kernel, 3, m);
     runtime_.argument(kernel, 4, k);
     runtime_.argument(kernel, 5, n);
-    runtime_.enqueue2(kernel, n, m);
+    runtime_.enqueue2Micro2x2(kernel, n, m);
 }
 
 void NativeTrainer::linearDInput(
