@@ -74,6 +74,11 @@ def main():
     listed=parse_sums(sums)
     expected=listed.get("validation.bin")
     if not expected:
+        for name,value in listed.items():
+            if Path(name).name == "validation.bin":
+                expected=value
+                break
+    if not expected:
         raise SystemExit("STOP: v1 SHA256SUMS has no validation.bin")
     got=sha256(v1_val)
     if got!=expected:
