@@ -25,7 +25,8 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DMNN_ROOT=" + rootProject.projectDir + "/vendor/MNN",
-                          "-DANDROID_STL=c++_shared"
+                          "-DANDROID_STL=c++_shared",
+                          "-DANDROID_TRAINER_GIT_COMMIT=" + gitSha
                 cppFlags "-std=c++17", "-O3", "-ffp-contract=off"
             }
         }

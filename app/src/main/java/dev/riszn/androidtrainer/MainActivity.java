@@ -80,7 +80,7 @@ public final class MainActivity extends Activity {
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.VERTICAL);
 
-        Button probe = button("1. Probe device + backends");
+        Button probe = button("1. Probe native OpenCL device");
         probe.setOnClickListener(v -> background("PROBE", () -> nativeProbe()));
         buttons.addView(probe);
 
@@ -93,13 +93,10 @@ public final class MainActivity extends Activity {
         select.setOnClickListener(v -> selectBundle());
         buttons.addView(select);
 
-        run = button("4. Legacy MNN exact gate (do not use)");
+        run = button("4. Run full native OpenCL training gate");
 
         run.setEnabled(false);
-        run.setOnClickListener(v -> Toast.makeText(
-                this,
-                "MNN GPU path retired. Use Native OpenCL conformance.",
-                Toast.LENGTH_LONG).show());
+        run.setOnClickListener(v -> runGate());
         buttons.addView(run);
 
         Button export = button("Export last JSON report");
@@ -281,8 +278,13 @@ public final class MainActivity extends Activity {
                 String nativeCheck = nativeValidateBundle(dest.getAbsolutePath());
                 append("bundle_sha256: " + bundleSha);
                 append(pretty(nativeCheck));
+                JSONObject nativeResult = new JSONObject(nativeCheck);
+                if (!"PASS".equals(nativeResult.optString("status"))) {
+                    throw new IllegalStateException(
+                            "native bundle validation failed: " + nativeCheck);
+                }
                 bundleDir = dest;
-                runOnUiThread(() -> run.setEnabled(false));
+                runOnUiThread(() -> run.setEnabled(true));
             } catch (Throwable t) {
                 append("IMPORT FAIL: " + t);
             }
@@ -359,7 +361,7 @@ public final class MainActivity extends Activity {
                 append("GATE FAIL: " + t);
             } finally {
                 if (wl != null && wl.isHeld()) wl.release();
-                runOnUiThread(() -> run.setEnabled(false));
+                runOnUiThread(() -> run.setEnabled(bundleDir != null));
             }
         }, "android-trainer-gate").start();
     }

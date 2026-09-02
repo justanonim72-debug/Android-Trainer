@@ -7,8 +7,8 @@ This repository separates cross-compilation from private model execution:
 ```
 GitHub Actions
   Android SDK 35 + NDK r27c + Gradle 8.9
-  MNN 3.6.1 @ d407447ed56c4121a11ccbd266dc184ca1ead0c2
-  arm64-v8a / FP32 / MNNTrain / OpenCL / Vulkan-buffer
+  MNN 3.6.1 CPU oracle @ d407447ed56c4121a11ccbd266dc184ca1ead0c2
+  arm64-v8a / native OpenCL C 1.2 / FP32 buffers
                          │
                          ▼
                 signed debug APK
@@ -21,7 +21,7 @@ GitHub Actions
               strict local .atb exporter
                          │
                          ▼
-      CPU parity → OpenCL/Vulkan training gate
+      MNN CPU oracle → pure native OpenCL full-step gate
 ```
 
 The public repository does **not** contain the user's checkpoint, Dataset v2,
@@ -58,22 +58,22 @@ The APK does not promote a backend because it merely starts successfully.
 It performs:
 
 1. local bundle integrity validation;
-2. exact PyTorch-reference → MNN CPU FP32 forward/loss/logit parity;
-3. raw gradient and global gradient-norm parity;
-4. one-step **fresh-state** decoupled AdamW parity with checkpoint-derived
-   per-parameter weight-decay semantics;
-5. actual MNN backend scheduling/fallback profiling;
-6. independent CPU, OpenCL and Vulkan-buffer training sessions;
-7. sustained 20-update exact-model throughput;
-8. finite-loss checks;
-9. atomic MNN checkpoint persistence;
-10. checkpoint reload verification;
-11. start/end Android thermal-headroom sampling;
-12. CPU/GPU target-token throughput ratios.
+2. exact PyTorch-reference → MNN **CPU-only** oracle parity;
+3. byte-probed loading of all 74 tensors into native OpenCL buffers;
+4. full native forward parity for loss and locked logits;
+5. explicit native reverse pass through all eight blocks, including a
+   deterministic tied-embedding reduction;
+6. raw gradient and global gradient-norm parity;
+7. one-step **fresh-state** clipped AdamW parity with bundle-derived
+   per-slot weight decay;
+8. deterministic native checkpoint persistence of parameters and Adam `m/v`,
+   followed by clear-and-reload probe verification;
+9. sustained 20-update native throughput, synchronized before the timer stops;
+10. start/end Android thermal-headroom and CPU/native throughput ratios.
 
-OpenCL is the primary GPU candidate. Vulkan buffer is a secondary empirical
-candidate and failure of one GPU backend does not invalidate evidence from the
-other.
+The GPU path does not instantiate an MNN GPU backend. It uses no Vulkan,
+OpenCL images, FP16, fast math, float atomics, or CPU fallback. One native
+OpenCL context, queue, program, and fixed kernel set live until process death.
 
 A backend is reported as:
 
@@ -96,7 +96,8 @@ Pushes to `gpu-gate-v1` run the complete GitHub Actions build. CI verifies:
 - APK signature;
 - Android 16-KiB zip alignment;
 - AArch64 native libraries;
-- packaged MNN, MNNTrain, OpenCL and Vulkan libraries;
+- packaged MNN/MNNTrain CPU-oracle libraries and absence of MNN OpenCL/Vulkan
+  libraries;
 - build manifest and SHA256 evidence.
 
 ## Export the completed local CPT-v2 bundle

@@ -1,4 +1,4 @@
-# Model #0001 GPU Gate v2
+# Model #0001 Pure Native OpenCL Gate
 
 ## Purpose
 
@@ -54,9 +54,8 @@ The exported PyTorch FP32 reference contains:
 The Android implementation must first pass MNN CPU parity. If MNN CPU parity
 fails, all GPU evidence is rejected.
 
-GPU candidates then run the same forward/backward/update graph. Candidate
-failures are isolated: an unavailable/broken Vulkan path cannot erase valid
-OpenCL evidence and vice versa.
+The GPU candidate is a pure native OpenCL C 1.2 implementation using only FP32
+buffers. MNN is never scheduled on GPU and remains strictly the CPU oracle.
 
 ## Optimizer semantics
 
@@ -74,31 +73,26 @@ The update is decoupled AdamW:
 
 with global max-norm clipping at 1.0.
 
-## Backends
+## Backends and constraints
 
-- MNN CPU FP32: mandatory correctness reference
-- MNN OpenCL FP32 IMAGE: primary GPU candidate
-- MNN Vulkan FP32 BUFFER: secondary candidate
+- MNN CPU FP32: mandatory oracle and CPU throughput baseline
+- pure native OpenCL C 1.2 FP32 BUFFER: the only GPU training backend
+- MNN GPU, Vulkan, OpenCL images, FP16, relaxed math, float atomics, and hidden
+  CPU fallback: disabled
 
 MNN is pinned to version 3.6.1 commit
-`d407447ed56c4121a11ccbd266dc184ca1ead0c2`.
-Vulkan is compiled with `MNN_VULKAN_IMAGE=OFF`.
+`d407447ed56c4121a11ccbd266dc184ca1ead0c2` and built without its OpenCL or
+Vulkan backends.
 
 ## Sustained benchmark
 
-Each backend loads an independent copy of the same serialized training model.
-A warm-up/compile update is excluded from timing, then 20 updates are timed.
-Reported throughput is target tokens per second.
+The native path performs one warm-up update, then times 20 full updates. A
+`clFinish` occurs before the stop timestamp. Reported throughput is target
+tokens per second and is compared with the MNN CPU-only baseline.
 
-Each completed session is persisted atomically as an MNN model and re-opened
-into a fresh Interpreter/Session. A candidate cannot become canonical if its
-checkpoint cannot be reloaded.
-
-## Backend scheduling evidence
-
-MNN operation callbacks inspect actual tensor backends during execution.
-Reports expose CPU/GPU/other backend hits, allowing hidden fallback to be
-distinguished from a genuinely GPU-scheduled graph.
+Before benchmarking, native parameters and Adam `m/v` are serialized in
+`android_trainer_native_checkpoint_v1` form. Live buffers are cleared, the
+checkpoint is reloaded, and compact probes must remain bit-identical.
 
 ## Thermal evidence
 

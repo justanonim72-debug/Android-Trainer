@@ -1,5 +1,6 @@
 #include "model0001_gate.hpp"
 #include "bundle.hpp"
+#include "native_opencl_trainer.hpp"
 
 #include <MNN/Interpreter.hpp>
 #include <MNN/Tensor.hpp>
@@ -1363,21 +1364,7 @@ std::string openClProbe() {
 } // namespace
 
 std::string probeBackendsJson() {
-    try {
-        auto cpu=makeExecutor(MNN_FORWARD_CPU,4,0);
-        auto cl=makeExecutor(MNN_FORWARD_OPENCL,1,MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE);
-        auto vk=makeExecutor(MNN_FORWARD_VULKAN,1,MNN_GPU_TUNING_WIDE);
-        std::ostringstream o;
-        o<<"{\"status\":\"PASS\",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT
-         <<"\",\"opencl\":"<<openClProbe()
-         <<",\"executors\":{\"cpu\":"<<(cpu?"true":"false")
-         <<",\"opencl\":"<<(cl?"true":"false")<<",\"vulkan_buffer\":"<<(vk?"true":"false")<<"}}";
-        markStage("run:success");
-        return o.str();
-    } catch(const std::exception& e) {
-        markStage(std::string("run:exception:")+e.what());
-        return std::string("{\"status\":\"FAIL\",\"error\":\"")+jsonEscape(e.what())+"\"}";
-    }
+    return probeNativeOpenClJson();
 }
 
 std::string validateBundleJson(const std::string& dir) {
@@ -1404,175 +1391,68 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         auto b=Bundle::load(dir);
         markStage("run:bundle_loaded");
 
-        // 1) Reference parity on MNN CPU. If the Python source did not expose
-        // the RoPE layout clearly, empirically select between the two standard
-        // layouts using the frozen PyTorch reference. Nothing is guessed silently.
+        // MNN remains CPU-only and is used solely as the locked oracle.
         Parity cpu;
         std::string ropeEvidence;
-        if (b.ropeStyle == "auto") {
-            b.ropeStyle = "half_split";
-            Parity half = dynamicParity(b,MNN_FORWARD_CPU,0);
-            if (half.pass) {
-                cpu = half;
-                ropeEvidence = "auto->half_split";
+        if(b.ropeStyle=="auto") {
+            b.ropeStyle="half_split";
+            Parity half=dynamicParity(b,MNN_FORWARD_CPU,0);
+            b.ropeStyle="interleaved";
+            Parity inter=dynamicParity(b,MNN_FORWARD_CPU,0);
+            if(inter.pass) {
+                cpu=inter;
+                ropeEvidence="auto->interleaved";
+            } else if(half.pass) {
+                return std::string("{\"status\":\"FAIL_ROPE_CONTRACT\",\"reason\":\"bundle resolves to half_split but issue freezes interleaved\",\"cpu_half_split\":")+
+                    parityJson(half)+",\"cpu_interleaved\":"+parityJson(inter)+"}";
             } else {
-                b.ropeStyle = "interleaved";
-                Parity inter = dynamicParity(b,MNN_FORWARD_CPU,0);
-                if (inter.pass) {
-                    cpu = inter;
-                    ropeEvidence = "auto->interleaved";
-                } else {
-                    return std::string("{\"status\":\"FAIL_CPU_PARITY\",\"reason\":\"neither supported RoPE layout matches PyTorch\",\"half_split\":")+
-                        parityJson(half)+",\"interleaved\":"+parityJson(inter)+"}";
-                }
+                return std::string("{\"status\":\"FAIL_CPU_ORACLE\",\"cpu_half_split\":")+
+                    parityJson(half)+",\"cpu_interleaved\":"+parityJson(inter)+"}";
             }
         } else {
-            ropeEvidence = "declared->" + b.ropeStyle;
-            markStage("run:cpu_parity:start");
-            cpu = dynamicParity(b,MNN_FORWARD_CPU,0);
-            markStage("run:cpu_parity:done");
+            ropeEvidence="declared->"+b.ropeStyle;
+            markStage("run:mnn_cpu_oracle:start");
+            cpu=dynamicParity(b,MNN_FORWARD_CPU,0);
+            markStage("run:mnn_cpu_oracle:done");
         }
         if(!cpu.pass) {
-            return std::string("{\"status\":\"FAIL_CPU_PARITY\",\"thermal_headroom_start\":")+
-                std::to_string(thermalHeadroom)+",\"cpu_parity\":"+parityJson(cpu)+"}";
+            return std::string("{\"status\":\"FAIL_CPU_ORACLE\",\"thermal_headroom_start\":")+
+                std::to_string(thermalHeadroom)+",\"mnn_cpu_oracle\":"+parityJson(cpu)+"}";
         }
 
-        // 2) The phone has already proven that MNN Express dynamic OpenCL
-        // parity is the wrong execution architecture for this gate: Android
-        // killed the process with REASON_LOW_MEMORY exactly at
-        // OPENCL:dynamic:gradnorm:start, where hostGlobalNorm() materializes
-        // every gradient tensor on the host. Keep dynamic autograd as the CPU
-        // oracle, but move GPU correctness to a serialized Session graph so MNN
-        // can plan/reuse all non-output intermediate memory.
-        Parity clDynamic;
-        clDynamic.backend="OPENCL";
-        clDynamic.pass=false;
-        clDynamic.error="skipped: proven Android LOW_MEMORY during dynamic OpenCL gradient materialization";
-        Parity vk;
-        vk.backend="VULKAN";
-        vk.pass=false;
-        vk.error="disabled_by_project_policy";
+        Bench cpuBench;
+        auto cpuBaseline=[&]() -> double {
+            const std::string base=workDir+"/model0001-cpu-baseline.mnn";
+            markStage("run:cpu_baseline:build");
+            buildStaticAdamWModel(b,base);
+            markStage("run:cpu_baseline:benchmark");
+            cpuBench=safeBenchStatic(
+                b,base,workDir,MNN_FORWARD_CPU,0,20,nullptr);
+            req(cpuBench.available&&cpuBench.finite&&cpuBench.stateChanged&&
+                cpuBench.checkpointReloadOk&&cpuBench.tokps>0,
+                "MNN CPU sustained baseline failed: "+cpuBench.error);
+            return cpuBench.tokps;
+        };
 
-        // 3) Read-only static parity remains the exact correctness gate.
-        // It has already proven on this device that compact OpenCL loss/logit/
-        // backward/AdamW probes execute correctly.  The only previous failure
-        // was destruction of the per-Session OpenCL Runtime.  Use one retained
-        // RuntimeInfo for BOTH OpenCL parity and the later training Session.
-        const std::string parityModel=
-            workDir+"/model0001-gate-static-parity.mnn";
-        markStage("run:static_parity_build:start");
-        auto paritySpec=buildStaticParityModel(b,parityModel);
-        markStage("run:static_parity_build:done");
-
-        markStage("run:cpu_static_parity:start");
-        auto cpuStatic=safeStaticParity(
-            b,paritySpec,MNN_FORWARD_CPU,0,nullptr);
-        markStage("run:cpu_static_parity:done");
-        if(!cpuStatic.pass) {
-            return std::string("{\"status\":\"FAIL_CPU_STATIC_PARITY\",\"thermal_headroom_start\":")+
-                std::to_string(thermalHeadroom)+
-                ",\"cpu_dynamic\":"+parityJson(cpu)+
-                ",\"cpu_static\":"+staticParityJson(cpuStatic)+"}";
-        }
-
-        const int sharedGpuMode=
-            MNN_GPU_TUNING_FAST|MNN_GPU_MEMORY_IMAGE;
-        RuntimeInfo& openclRuntime=processOpenCLRuntime(sharedGpuMode);
-
-        markStage("run:opencl_static_parity:start");
-        auto clStatic=safeStaticParity(
-            b,paritySpec,MNN_FORWARD_OPENCL,sharedGpuMode,&openclRuntime);
-        markStage("run:opencl_static_parity:done");
-        if(!clStatic.pass) {
-            return std::string("{\"status\":\"FAIL_OPENCL_STATIC_PARITY\",\"thermal_headroom_start\":")+
-                std::to_string(thermalHeadroom)+
-                ",\"cpu_dynamic\":"+parityJson(cpu)+
-                ",\"cpu_static\":"+staticParityJson(cpuStatic)+
-                ",\"opencl_static\":"+staticParityJson(clStatic)+
-                ",\"opencl_runtime\":"+openClProbe()+
-                ",\"lifetime\":\"shared_process_runtime\"}";
-        }
-
-        // 4) Build the mutating loop model using the exact shape MNN upstream
-        // uses in transformerExecution.cpp: loss output + parameter update pair.
-        // No arbitrary gradient/parameter probe outputs are added to this
-        // stateful graph; those semantics were already locked by static parity.
-        const std::string base=
-            workDir+"/model0001-gate-static-train.mnn";
-        markStage("run:static_train_build:start");
-        buildStaticAdamWModel(b,base);
-        markStage("run:static_train_build:done");
-
-        const int steps=20;
-
-        markStage("run:cpu_static_train:start");
-        Bench bc=safeBenchStatic(
-            b,base,workDir,MNN_FORWARD_CPU,0,steps,nullptr);
-        markStage("run:cpu_static_train:done");
-        if(!(bc.available&&bc.finite&&bc.stateChanged&&bc.checkpointReloadOk)) {
-            return std::string("{\"status\":\"FAIL_CPU_STATIC_TRAIN\",\"thermal_headroom_start\":")+
-                std::to_string(thermalHeadroom)+
-                ",\"cpu_dynamic\":"+parityJson(cpu)+
-                ",\"cpu_static_parity\":"+staticParityJson(cpuStatic)+
-                ",\"cpu_train\":"+benchJson(bc)+"}";
-        }
-
-        markStage("run:opencl_static_train:start");
-        Bench bg=safeBenchStatic(
-            b,base,workDir,MNN_FORWARD_OPENCL,
-            sharedGpuMode,steps,&openclRuntime);
-        markStage("run:opencl_static_train:done");
-
-        Bench bv;
-        bv.backend="VULKAN";
-        bv.error="disabled_by_project_policy";
-
-        const double cpuT=bc.tokps;
-        const double clRatio=(cpuT>0&&bg.tokps>0)?bg.tokps/cpuT:0.0;
-        const double vkRatio=0.0;
-
-        // A training backend is accepted only after static correctness has
-        // passed. Speed alone can never promote it.
-        const bool clTrainOk=
-            bg.available&&bg.finite&&bg.stateChanged&&
-            bg.checkpointReloadOk&&bg.gpuOps>0;
-        const bool clUseful=clTrainOk&&clRatio>=1.5;
-        const bool clCanonical=clTrainOk&&clRatio>=2.0;
-        const bool vkUseful=false;
-        const bool vkCanonical=false;
-
-        std::string winner="CPU";
-        if(clCanonical){winner="OPENCL";}
-
-        std::ostringstream o;
-        o<<"{\"status\":\"PASS\",\"schema\":\"model0001_gpu_gate_report_v4\""
-         <<",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT<<"\""
-         <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
-         <<",\"model_state_sha256\":\""<<b.modelStateSha256<<"\""
-         <<",\"rope_evidence\":\""<<jsonEscape(ropeEvidence)<<"\""
-         <<",\"thermal_headroom_start\":"<<thermalHeadroom
-         <<",\"opencl_runtime\":"<<openClProbe()
-         <<",\"dynamic_parity\":{\"cpu\":"<<parityJson(cpu)
-         <<",\"opencl\":"<<parityJson(clDynamic)<<"}"
-         <<",\"static_parity\":{\"cpu\":"<<staticParityJson(cpuStatic)
-         <<",\"opencl\":"<<staticParityJson(clStatic)<<"}"
-         <<",\"static_train\":{\"cpu\":"<<benchJson(bc)
-         <<",\"opencl\":"<<benchJson(bg)
-         <<",\"vulkan_buffer\":"<<benchJson(bv)<<"}"
-         <<",\"speed_ratio\":{\"opencl_vs_cpu\":"<<clRatio
-         <<",\"vulkan_vs_cpu\":"<<vkRatio<<"}"
-         <<",\"useful_1_5x\":{\"opencl\":"<<(clUseful?"true":"false")
-         <<",\"vulkan_buffer\":"<<(vkUseful?"true":"false")<<"}"
-         <<",\"canonical_2x\":{\"opencl\":"<<(clCanonical?"true":"false")
-         <<",\"vulkan_buffer\":"<<(vkCanonical?"true":"false")<<"}"
-         <<",\"recommended_backend\":\""<<winner<<"\""
-         <<",\"opencl_lifetime\":\"shared_process_runtime\""
-         <<",\"opencl_gpu_mode\":\"TUNING_FAST|MEMORY_IMAGE\""
-         <<",\"note\":\"Correctness and mutation are deliberately separated. A read-only compact static graph validates FP32 loss/logits/backward/global-grad-norm/fresh-AdamW probes against the frozen PyTorch reference. A separate upstream-style makeLoopModel graph exposes only loss, proves state mutation plus CPU-reloadable checkpointing, and measures sustained CPU/OpenCL training. Both OpenCL Sessions share one process-lifetime RuntimeInfo, so Sessions are released normally while the Mali kernel pool is retained and the proven clReleaseKernel driver crash is never entered during app lifetime.\"}";
-        const auto report=o.str();
-        gCompletedGateReport=report;
-        markStage("run:success:shared_opencl_runtime");
-        return report;
+        markStage("run:pure_native_opencl:start");
+        const NativeGateResult native=runNativeModel0001Gate(
+            b,workDir,cpuBaseline);
+        std::ostringstream out;
+        out<<"{\"status\":\""<<(native.pass?"PASS":"FAIL_NATIVE_GATE")<<"\""
+           <<",\"schema\":\"model0001_full_native_gate_report_v1\""
+           <<",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+           <<",\"mnn_usage\":\"CPU_ORACLE_ONLY\""
+           <<",\"mnn_commit\":\""<<ANDROID_TRAINER_MNN_COMMIT<<"\""
+           <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
+           <<",\"model_state_sha256\":\""<<b.modelStateSha256<<"\""
+           <<",\"rope_evidence\":\""<<jsonEscape(ropeEvidence)<<"\""
+           <<",\"thermal_headroom_start\":"<<thermalHeadroom
+           <<",\"mnn_cpu_oracle\":"<<parityJson(cpu)
+           <<",\"cpu_baseline\":"<<(cpuBench.available?benchJson(cpuBench):"null")
+           <<",\"native_gate\":"<<native.json<<"}";
+        gCompletedGateReport=out.str();
+        markStage(native.pass?"run:success:pure_native_opencl":"run:fail:pure_native_opencl");
+        return gCompletedGateReport;
     } catch(const std::exception& e) {
         return std::string("{\"status\":\"FAIL\",\"error\":\"")+jsonEscape(e.what())+"\"}";
     }

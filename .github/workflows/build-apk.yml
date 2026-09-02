@@ -42,8 +42,6 @@ jobs:
           test "$(git -C vendor/MNN rev-parse HEAD)" = "$MNN_COMMIT"
           grep -q 'option(MNN_BUILD_TRAIN' vendor/MNN/CMakeLists.txt
           grep -q 'add_library(MNNTrain SHARED' vendor/MNN/tools/train/CMakeLists.txt
-          grep -q 'MNN_OPENCL' vendor/MNN/CMakeLists.txt
-          grep -q 'MNN_VULKAN_IMAGE' vendor/MNN/source/backend/vulkan/CMakeLists.txt
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -103,8 +101,8 @@ jobs:
           test -s build/apkcheck/lib/arm64-v8a/libMNN.so
           test -s build/apkcheck/lib/arm64-v8a/libMNN_Express.so
           test -s build/apkcheck/lib/arm64-v8a/libMNNTrain.so
-          test -s build/apkcheck/lib/arm64-v8a/libMNN_CL.so
-          test -s build/apkcheck/lib/arm64-v8a/libMNN_Vulkan.so
+          test ! -e build/apkcheck/lib/arm64-v8a/libMNN_CL.so
+          test ! -e build/apkcheck/lib/arm64-v8a/libMNN_Vulkan.so
 
           READELF="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           for so in build/apkcheck/lib/arm64-v8a/*.so; do
@@ -137,12 +135,14 @@ jobs:
             "build_tools":os.environ["ANDROID_BUILD_TOOLS"],
             "abi":["arm64-v8a"],
             "precision_gate":"FP32",
-            "opencl":True,
-            "vulkan_buffer":True,
+            "native_opencl_c_1_2_fp32_buffer":True,
+            "mnn_gpu":False,
+            "vulkan":False,
             "mnn_build_train":True,
             "mnn_mali_teardown_patch":False,
-            "opencl_session_lifetime":"process_persistent_session",
-            "opencl_correctness_graph":"single_stateful_fp32_adamw",
+            "opencl_runtime_lifetime":"process_long_no_teardown",
+            "opencl_training":"explicit_forward_backward_adamw",
+            "native_checkpoint":"android_trainer_native_checkpoint_v1",
             "frozen_model":{
               "params":19145088,
               "vocab":14000,
