@@ -51,20 +51,58 @@ Accepted physical build:
 
 No more GPU microbenchmarking is required before the Dataset-v3 stage.
 
+## Friend-Core objective guardrail
+
+Dataset-v3 is still an F1/Foundation continued-pretraining stage. It exists to
+move Model #0001 toward the locked Friend Core target, NOT toward encyclopedic
+memorization.
+
+The Training Blueprint explicitly defines Friend Core as:
+- personal companion / natural chat first;
+- Indonesian + Indonesian-English code-switch;
+- short natural replies, slang/abbreviations, relationship continuity;
+- basic reasoning/general knowledge sufficient for conversation;
+- current/fresh facts delegated to search/tools;
+- NOT a tiny encyclopedia that wastes limited capacity on broad knowledge.
+
+The Blueprint's Friend data-mixture starting experiment is:
+- natural Indonesian chat/slang: 30-40%;
+- formal/neutral Indonesian: 10-15%;
+- English + Indo-English code-switch: 15-20%;
+- multi-turn social/relationship dialogue: 10-15%;
+- tool/memory/scheduler examples: 10-15%;
+- reasoning/general utility/safety: 10-15%.
+
+Those shares overlap by stage and MUST NOT be blindly copied into one CPT
+epoch. In particular, structured tool/memory/scheduler supervision belongs
+primarily to F2 SFT, not to this F1 CPT pack.
+
+For Dataset-v3 CPT, the stage objective is therefore:
+1. substantially increase natural/colloquial Indonesian coverage;
+2. add real code-switch coverage (v2 effectively had almost none);
+3. add dialogue-like/social text without turning CPT into instruction tuning;
+4. preserve enough English/basic reasoning/neutral Indonesian for retention;
+5. keep encyclopedic/formal factual text a supporting component, never the
+   dominant identity of the pack.
+
 ## Dataset-v3 requirements
 
 Before packing:
 - inventory the local project sources and the exact v1/v2 builder history;
-- identify genuinely new/expanded source data;
+- identify genuinely NEW/expanded source data;
+- exclude project docs, reports, tokenizer artifacts, benchmark files and test
+  data from candidate training sources;
 - preserve an explicit retention component without silently replaying the
-  frozen Dataset-v2 pack;
-- deduplicate against prior source content where provenance permits;
+  frozen Dataset-v2 train.bin;
+- deduplicate new source content against prior v1/v2 source content where
+  provenance permits;
 - create immutable train/validation identities;
 - preserve tokenizer v1 exactly;
 - do not create/use a test split for this stage.
 
-Exact mixture percentages and total Dataset-v3 tokens are NOT invented here.
-They are locked only after the source inventory.
+Exact Dataset-v3 CPT mixture percentages and total token budget are locked only
+after NEW source acquisition/quality audit. The overall Friend blueprint ranges
+above are behavior guardrails, not permission to mix every family into CPT.
 
 ## Next action
 
