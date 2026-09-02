@@ -1219,6 +1219,171 @@ struct StateProbe {
     float moment2 = 0.0f;
 };
 
+
+struct PilotDataFile {
+    std::string relativePath;
+    std::vector<uint16_t> tokens;
+    int fullWindows = 0;
+};
+
+struct PilotPackageData {
+    std::vector<double> lrCandidates;
+    std::vector<int> trainIndices;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+    int trainSteps = 0;
+    int warmupSteps = 0;
+    PilotDataFile train;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+};
+
+std::string safePilotPath(
+    const std::string& root, const std::string& relative) {
+    req(!relative.empty() && relative[0] != '/' &&
+            relative.find("..") == std::string::npos,
+        "unsafe pilot relative path");
+    return root + "/" + relative;
+}
+
+std::vector<uint16_t> readU16LeFile(const std::string& path) {
+    const auto bytes = readBinaryFile(path);
+    req(!bytes.empty() && bytes.size() % 2 == 0,
+        "pilot uint16 file has invalid byte length: " + path);
+    std::vector<uint16_t> result(bytes.size() / 2);
+    for (size_t i = 0; i < result.size(); ++i) {
+        result[i] = static_cast<uint16_t>(
+            static_cast<uint16_t>(bytes[i * 2]) |
+            (static_cast<uint16_t>(bytes[i * 2 + 1]) << 8));
+        req(result[i] < V, "pilot token out of vocabulary");
+    }
+    return result;
+}
+
+std::vector<int> readIndexArray(
+    const rapidjson::Value& parent, const char* key) {
+    req(parent.HasMember(key) && parent[key].IsArray(),
+        std::string("pilot manifest missing index array: ") + key);
+    std::vector<int> result;
+    for (const auto& value : parent[key].GetArray()) {
+        req(value.IsInt() && value.GetInt() >= 0,
+            std::string("invalid pilot index: ") + key);
+        result.push_back(value.GetInt());
+    }
+    req(!result.empty(), std::string("empty pilot index array: ") + key);
+    return result;
+}
+
+PilotDataFile loadPilotDataFile(
+    const std::string& root, const rapidjson::Value& data,
+    const char* key) {
+    req(data.HasMember(key) && data[key].IsObject(),
+        std::string("pilot data manifest missing: ") + key);
+    const auto& spec = data[key];
+    req(spec.HasMember("path") && spec["path"].IsString() &&
+            spec.HasMember("full_windows") && spec["full_windows"].IsInt() &&
+            spec.HasMember("uint16_tokens") && spec["uint16_tokens"].IsUint64(),
+        std::string("invalid pilot data spec: ") + key);
+    PilotDataFile file;
+    file.relativePath = spec["path"].GetString();
+    file.fullWindows = spec["full_windows"].GetInt();
+    req(file.fullWindows > 0, "pilot data has zero windows");
+    file.tokens = readU16LeFile(safePilotPath(root, file.relativePath));
+    req(file.tokens.size() == spec["uint16_tokens"].GetUint64(),
+        "pilot data token count mismatch");
+    req(static_cast<int>((file.tokens.size() - 1) / S) == file.fullWindows,
+        "pilot data full-window count mismatch");
+    return file;
+}
+
+PilotPackageData loadPilotPackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid pilot manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_v3_lr_pilot_v1",
+        "unsupported pilot schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d",
+        "pilot source model SHA mismatch");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "pilot hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "pilot package must not contain test split");
+    req(guards.HasMember("dataset_v2_train_bin_packaged") &&
+            guards["dataset_v2_train_bin_packaged"].IsBool() &&
+            !guards["dataset_v2_train_bin_packaged"].GetBool(),
+        "pilot package must not contain Dataset-v2 train bin");
+    req(doc.HasMember("protocol") && doc["protocol"].IsObject(),
+        "pilot protocol missing");
+    const auto& protocol = doc["protocol"];
+    req(protocol.HasMember("train_steps_per_candidate") &&
+            protocol["train_steps_per_candidate"].IsInt() &&
+            protocol.HasMember("warmup_steps") &&
+            protocol["warmup_steps"].IsInt() &&
+            protocol.HasMember("lr_candidates") &&
+            protocol["lr_candidates"].IsArray(),
+        "pilot protocol malformed");
+
+    PilotPackageData result;
+    result.trainSteps = protocol["train_steps_per_candidate"].GetInt();
+    result.warmupSteps = protocol["warmup_steps"].GetInt();
+    req(result.trainSteps == 96 && result.warmupSteps == 3,
+        "pilot step/warmup contract drift");
+    for (const auto& value : protocol["lr_candidates"].GetArray()) {
+        req(value.IsNumber(), "pilot LR candidate is not numeric");
+        const double lr = value.GetDouble();
+        req(std::isfinite(lr) && lr >= 5.0e-5 && lr <= 2.0e-4,
+            "pilot LR candidate outside locked CPT pilot range");
+        result.lrCandidates.push_back(lr);
+    }
+    req(result.lrCandidates.size() == 3,
+        "pilot must contain exactly three LR candidates");
+
+    req(doc.HasMember("indices") && doc["indices"].IsObject(),
+        "pilot indices missing");
+    const auto& indices = doc["indices"];
+    result.trainIndices = readIndexArray(indices, "train");
+    result.v3EvalIndices = readIndexArray(indices, "v3_validation");
+    result.v1EvalIndices = readIndexArray(indices, "v1_validation");
+    req(static_cast<int>(result.trainIndices.size()) == result.trainSteps,
+        "pilot train index count mismatch");
+    req(result.v3EvalIndices.size() == 24 &&
+            result.v1EvalIndices.size() == 24,
+        "pilot eval-window count drift");
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "pilot data section missing");
+    const auto& data = doc["data"];
+    result.train = loadPilotDataFile(root, data, "v3_train");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("pilot index outside ") + label);
+        }
+    };
+    validateIndices(result.trainIndices, result.train.fullWindows, "v3 train");
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows, "v3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows, "v1 validation");
+    return result;
+}
+
 class NativeTrainer {
 public:
     NativeTrainer(const Bundle& bundle, std::string workDirectory)
