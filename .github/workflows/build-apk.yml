@@ -65,8 +65,15 @@ jobs:
           gradle-version: "8.9"
           validate-wrappers: false
 
-      - name: Python exporter syntax check
-        run: python3 -m py_compile tools/export_model0001_bundle.py
+      - name: Python tooling syntax check
+        run: |
+          python3 -m py_compile \
+            tools/export_model0001_bundle.py \
+            tools/audit_model0001_transition.py \
+            tools/audit_model0001_v3_sources.py \
+            tools/acquire_model0001_v3_sources.py \
+            tools/prepare_model0001_v3_pool.py \
+            tools/build_model0001_stage_package.py
 
       - name: Guard public repository against local model data
         shell: bash
