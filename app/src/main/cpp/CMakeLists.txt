@@ -26,7 +26,7 @@ set(MNN_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
 string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
 add_subdirectory("${MNN_ROOT}" "${CMAKE_BINARY_DIR}/mnn" EXCLUDE_FROM_ALL)
 
-add_library(android_trainer SHARED native_bridge.cpp bundle.cpp model0001_gate.cpp)
+add_library(android_trainer SHARED native_bridge.cpp bundle.cpp model0001_gate.cpp native_opencl_conformance.cpp)
 target_include_directories(android_trainer PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
     "${MNN_ROOT}/include"

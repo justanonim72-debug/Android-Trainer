@@ -50,6 +50,7 @@ public final class MainActivity extends Activity {
     private PowerManager powerManager;
 
     private static native String nativeProbe();
+    private static native String nativeOpenClConformance();
     private static native String nativeValidateBundle(String bundleDir);
     private static native String nativeRunGate(String bundleDir, String workDir, float thermalHeadroom);
 
@@ -70,7 +71,7 @@ public final class MainActivity extends Activity {
         root.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("FP32 correctness → real backward → AdamW → sustained speed");
+        subtitle.setText("Pure OpenCL C 1.2 FP32 buffer conformance • MNN GPU retired");
         subtitle.setTextColor(0xff9aa0a6);
         subtitle.setTextSize(13);
         subtitle.setPadding(0, 6, 0, 20);
@@ -83,13 +84,22 @@ public final class MainActivity extends Activity {
         probe.setOnClickListener(v -> background("PROBE", () -> nativeProbe()));
         buttons.addView(probe);
 
-        Button select = button("2. Import local .atb bundle");
+        Button nativeGate = button("2. Native OpenCL primitive conformance");
+        nativeGate.setOnClickListener(v -> background(
+                "NATIVE OPENCL CONFORMANCE", () -> nativeOpenClConformance()));
+        buttons.addView(nativeGate);
+
+        Button select = button("3. Import local .atb bundle");
         select.setOnClickListener(v -> selectBundle());
         buttons.addView(select);
 
-        run = button("3. Run exact GPU Gate");
+        run = button("4. Legacy MNN exact gate (do not use)");
+
         run.setEnabled(false);
-        run.setOnClickListener(v -> runGate());
+        run.setOnClickListener(v -> Toast.makeText(
+                this,
+                "MNN GPU path retired. Use Native OpenCL conformance.",
+                Toast.LENGTH_LONG).show());
         buttons.addView(run);
 
         Button export = button("Export last JSON report");
@@ -272,7 +282,7 @@ public final class MainActivity extends Activity {
                 append("bundle_sha256: " + bundleSha);
                 append(pretty(nativeCheck));
                 bundleDir = dest;
-                runOnUiThread(() -> run.setEnabled(true));
+                runOnUiThread(() -> run.setEnabled(false));
             } catch (Throwable t) {
                 append("IMPORT FAIL: " + t);
             }
@@ -349,7 +359,7 @@ public final class MainActivity extends Activity {
                 append("GATE FAIL: " + t);
             } finally {
                 if (wl != null && wl.isHeld()) wl.release();
-                runOnUiThread(() -> run.setEnabled(bundleDir != null));
+                runOnUiThread(() -> run.setEnabled(false));
             }
         }, "android-trainer-gate").start();
     }

@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <string>
 #include "model0001_gate.hpp"
+#include "native_opencl_conformance.hpp"
 
 namespace {
 std::string jstr(JNIEnv* env, jstring s) {
@@ -18,6 +19,11 @@ jstring ret(JNIEnv* env, const std::string& s) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_riszn_androidtrainer_MainActivity_nativeProbe(JNIEnv* env, jclass) {
     return ret(env, at::probeBackendsJson());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_riszn_androidtrainer_MainActivity_nativeOpenClConformance(JNIEnv* env, jclass) {
+    return ret(env, at::runNativeOpenClConformanceJson());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
