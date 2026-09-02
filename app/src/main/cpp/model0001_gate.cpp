@@ -1417,7 +1417,8 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
         }
         if(!cpu.pass) {
             return std::string("{\"status\":\"FAIL_CPU_ORACLE\",\"thermal_headroom_start\":")+
-                std::to_string(thermalHeadroom)+",\"mnn_cpu_oracle\":"+parityJson(cpu)+"}";
+                (std::isfinite(thermalHeadroom)?std::to_string(thermalHeadroom):"null")+
+                ",\"mnn_cpu_oracle\":"+parityJson(cpu)+"}";
         }
 
         Bench cpuBench;
@@ -1446,7 +1447,8 @@ std::string runModel0001GateJson(const std::string& dir,const std::string& workD
            <<",\"checkpoint_sha256\":\""<<b.checkpointSha256<<"\""
            <<",\"model_state_sha256\":\""<<b.modelStateSha256<<"\""
            <<",\"rope_evidence\":\""<<jsonEscape(ropeEvidence)<<"\""
-           <<",\"thermal_headroom_start\":"<<thermalHeadroom
+           <<",\"thermal_headroom_start\":"
+           <<(std::isfinite(thermalHeadroom)?std::to_string(thermalHeadroom):"null")
            <<",\"mnn_cpu_oracle\":"<<parityJson(cpu)
            <<",\"cpu_baseline\":"<<(cpuBench.available?benchJson(cpuBench):"null")
            <<",\"native_gate\":"<<native.json<<"}";
