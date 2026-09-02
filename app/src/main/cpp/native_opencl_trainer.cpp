@@ -1082,6 +1082,7 @@ private:
     }
 
     void initializeSlots();
+    void resetToSourceState();
     void initializeInputs();
     void setTrainingWindow(const int32_t* tokens257);
     void setLearningRate(float lr);
@@ -1177,6 +1178,29 @@ void NativeTrainer::initializeSlots() {
         "native trainer loaded parameter count mismatch");
     runtime_.finish();
     wireLayers();
+}
+
+void NativeTrainer::resetToSourceState() {
+    // Correctness gates intentionally mutate the native state (AdamW parity
+    // performs one real optimizer update and checkpoint verification reloads
+    // that updated state).  Sustained performance must not inherit that
+    // mutation: the CPU denominator starts from the immutable CPT-v2 source
+    // weights with fresh zero moments.  Restore the exact same state here.
+    for (auto& pair : slots_) {
+        auto& value = pair.second;
+        const auto& source = bundle_.tensor(pair.first).data;
+        req(source.size() == value.elements,
+            "source tensor size drift during benchmark reset: " + value.name);
+        const size_t bytes = bytesFor(value.elements);
+        runtime_.write(value.parameter, source.data(), bytes);
+        runtime_.zero(value.gradient, bytes);
+        runtime_.zero(value.moment1, bytes);
+        runtime_.zero(value.moment2, bytes);
+    }
+    optimizerStep_ = 0;
+    setTrainingWindow(bundle_.sampleTokens.data());
+    setLearningRate(static_cast<float>(bundle_.adam.gateLr));
+    runtime_.finish();
 }
 
 void NativeTrainer::wireLayers() {
@@ -2308,6 +2332,13 @@ BenchmarkGate NativeTrainer::benchmark(
     const std::function<double()>& cpuBaseline) {
     BenchmarkGate gate;
 
+    // Gate 4 performs one real AdamW update and gate 5 reloads that mutated
+    // checkpoint.  The CPU reference benchmark starts from immutable CPT-v2
+    // weights with fresh zero moments, so reset before warmup/timing to make
+    // the sustained comparison truly apples-to-apples.
+    resetToSourceState();
+    req(optimizerStep_ == 0, "benchmark reset did not restore optimizer step");
+
     // Gates 1-5 already prove correctness. A missing/invalid CPU speed
     // baseline must not block the native GPU benchmark itself.
     if (cpuBaseline) {
@@ -2560,6 +2591,9 @@ NativeGateResult NativeTrainer::run(
             << ",\"warmup_steps\":" << benchmarkGate.warmupSteps
             << ",\"timed_steps\":" << benchmarkGate.timedSteps
             << ",\"target_tokens_per_step\":" << S
+            << ",\"reset_to_source_before_benchmark\":true"
+            << ",\"starting_optimizer_step\":0"
+            << ",\"ending_optimizer_step\":" << (benchmarkGate.warmupSteps + benchmarkGate.timedSteps)
             << ",\"seconds\":" << benchmarkGate.seconds
             << ",\"synchronized_before_stop\":true"
             << ",\"native_tokens_per_second\":"
