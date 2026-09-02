@@ -286,33 +286,35 @@ __kernel void linear_dweight(
     float acc10 = 0.0f, acc11 = 0.0f;
 
     for (int t = 0; t < m; t += TILE) {
-        const int m0 = t + ty;
-        const int m1 = m0 + 1;
+        // yy is stored transposed as [output-n][reduction-m], matching the
+        // original 16x16 kernel exactly. aa is [reduction-m][output-k].
         const int mc0 = t + tx;
         const int mc1 = mc0 + 1;
+        const int mr0 = t + ty;
+        const int mr1 = mr0 + 1;
 
         yy[ty][tx] =
-            (m0 < m && n0 < n) ? dy[m0 * n + n0] : 0.0f;
+            (mc0 < m && n0 < n) ? dy[mc0 * n + n0] : 0.0f;
         yy[ty][tx + 1] =
-            (m0 < m && n1 < n) ? dy[m0 * n + n1] : 0.0f;
+            (mc1 < m && n0 < n) ? dy[mc1 * n + n0] : 0.0f;
         yy[ty + 1][tx] =
-            (m1 < m && n0 < n) ? dy[m1 * n + n0] : 0.0f;
+            (mc0 < m && n1 < n) ? dy[mc0 * n + n1] : 0.0f;
         yy[ty + 1][tx + 1] =
-            (m1 < m && n1 < n) ? dy[m1 * n + n1] : 0.0f;
+            (mc1 < m && n1 < n) ? dy[mc1 * n + n1] : 0.0f;
 
         aa[ty][tx] =
-            (m0 < m && k0 < k) ? a[m0 * k + k0] : 0.0f;
+            (mr0 < m && k0 < k) ? a[mr0 * k + k0] : 0.0f;
         aa[ty][tx + 1] =
-            (m0 < m && k1 < k) ? a[m0 * k + k1] : 0.0f;
+            (mr0 < m && k1 < k) ? a[mr0 * k + k1] : 0.0f;
         aa[ty + 1][tx] =
-            (m1 < m && k0 < k) ? a[m1 * k + k0] : 0.0f;
+            (mr1 < m && k0 < k) ? a[mr1 * k + k0] : 0.0f;
         aa[ty + 1][tx + 1] =
-            (m1 < m && k1 < k) ? a[m1 * k + k1] : 0.0f;
+            (mr1 < m && k1 < k) ? a[mr1 * k + k1] : 0.0f;
 
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int q = 0; q < TILE; ++q) {
-            const float y0 = yy[q][ty];
-            const float y1 = yy[q][ty + 1];
+            const float y0 = yy[ty][q];
+            const float y1 = yy[ty + 1][q];
             const float a0 = aa[q][tx];
             const float a1 = aa[q][tx + 1];
             acc00 += y0 * a0;
