@@ -2867,7 +2867,12 @@ void NativeTrainer::saveCheckpoint(
         fileWrite(file, bundle_.adam.beta1, "beta1");
         fileWrite(file, bundle_.adam.beta2, "beta2");
         fileWrite(file, bundle_.adam.eps, "eps");
-        fileWrite(file, bundle_.adam.gateLr, "learning_rate");
+        const double checkpointLearningRate =
+            static_cast<double>(currentLearningRate_);
+        req(std::isfinite(checkpointLearningRate) &&
+                checkpointLearningRate > 0.0,
+            "checkpoint learning rate is invalid");
+        fileWrite(file, checkpointLearningRate, "learning_rate");
         writeString(file, ANDROID_TRAINER_GIT_COMMIT, "commit");
         writeString(file, bundle_.checkpointSha256, "source_checkpoint_sha256");
         writeString(file, bundle_.modelStateSha256, "source_model_sha256");
@@ -2955,7 +2960,8 @@ void NativeTrainer::loadCheckpoint(const std::string& path) {
         fileRead(file, &eps, "eps");
         fileRead(file, &lr, "learning_rate");
         req(beta1 == bundle_.adam.beta1 && beta2 == bundle_.adam.beta2 &&
-            eps == bundle_.adam.eps && lr == bundle_.adam.gateLr,
+            eps == bundle_.adam.eps &&
+            std::isfinite(lr) && lr > 0.0 && lr <= 2.0e-4,
             "native checkpoint optimizer contract mismatch");
         const std::string commit = readString(file, "commit");
         const std::string checkpointSha =
@@ -3011,6 +3017,7 @@ void NativeTrainer::loadCheckpoint(const std::string& path) {
         req(std::fclose(file) == 0, "native checkpoint fclose failed");
         file = nullptr;
         optimizerStep_ = step;
+        currentLearningRate_ = static_cast<float>(lr);
         runtime_.finish();
     } catch (...) {
         if (file) std::fclose(file);
