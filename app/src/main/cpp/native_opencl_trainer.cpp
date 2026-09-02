@@ -972,6 +972,17 @@ struct BenchmarkGate {
     bool canonical = false;
 };
 
+struct StageProfile {
+    bool pass = false;
+    int warmupSteps = 1;
+    int profiledSteps = 3;
+    double forwardSeconds = 0.0;
+    double backwardSeconds = 0.0;
+    double gradNormSeconds = 0.0;
+    double adamwSeconds = 0.0;
+    double totalSeconds = 0.0;
+};
+
 struct StateProbe {
     std::string slot;
     int index = 0;
@@ -1130,6 +1141,7 @@ private:
     void saveCheckpoint(const std::string& path, size_t* bytesWritten);
     void loadCheckpoint(const std::string& path);
     BenchmarkGate benchmark(const std::function<double()>& cpuBaseline);
+    StageProfile profileStages();
     std::string memoryJson() const;
 };
 
@@ -2373,6 +2385,50 @@ BenchmarkGate NativeTrainer::benchmark(
     return gate;
 }
 
+StageProfile NativeTrainer::profileStages() {
+    StageProfile profile;
+
+    // Diagnostic-only path. The official sustained benchmark has already
+    // completed before this method is called. We deliberately reset again so
+    // the profiler cannot inherit benchmark state or affect acceptance data.
+    resetToSourceState();
+
+    // One untimed warmup, then reset again so profiled steps start at the same
+    // optimizer state while all kernels/runtime objects are already hot.
+    fullTrainingStep();
+    runtime_.finish();
+    resetToSourceState();
+
+    auto measure = [&](auto&& fn) {
+        const auto started = std::chrono::steady_clock::now();
+        fn();
+        runtime_.finish();
+        const auto stopped = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(stopped - started).count();
+    };
+
+    for (int i = 0; i < profile.profiledSteps; ++i) {
+        profile.forwardSeconds += measure([&]() { forward(); });
+        profile.backwardSeconds += measure([&]() { backward(); });
+        profile.gradNormSeconds += measure([&]() { computeGlobalNorm(); });
+        profile.adamwSeconds += measure([&]() { adamStep(); });
+    }
+
+    profile.totalSeconds =
+        profile.forwardSeconds +
+        profile.backwardSeconds +
+        profile.gradNormSeconds +
+        profile.adamwSeconds;
+
+    profile.pass =
+        std::isfinite(profile.forwardSeconds) && profile.forwardSeconds > 0.0 &&
+        std::isfinite(profile.backwardSeconds) && profile.backwardSeconds > 0.0 &&
+        std::isfinite(profile.gradNormSeconds) && profile.gradNormSeconds > 0.0 &&
+        std::isfinite(profile.adamwSeconds) && profile.adamwSeconds > 0.0 &&
+        std::isfinite(profile.totalSeconds) && profile.totalSeconds > 0.0;
+    return profile;
+}
+
 std::string NativeTrainer::memoryJson() const {
     const size_t total = persistentBytes_ + activationBytes_ + workspaceBytes_;
     std::ostringstream out;
@@ -2414,6 +2470,7 @@ NativeGateResult NativeTrainer::run(
     std::string adamJson = "null";
     std::string checkpointJson = "null";
     std::string benchmarkJson = "null";
+    std::string profileJson = "null";
     std::string firstFailure;
     std::string firstOperator;
     std::string firstProbe;
@@ -2449,6 +2506,7 @@ NativeGateResult NativeTrainer::run(
             << ",\"checkpoint_verification\":" << checkpointJson
             << ",\"memory_estimates\":" << memoryJson()
             << ",\"sustained_benchmark\":" << benchmarkJson
+            << ",\"performance_profile\":" << profileJson
             << ",\"first_failing_stage\":"
             << (firstFailure.empty()
                 ? "null"
@@ -2617,6 +2675,37 @@ NativeGateResult NativeTrainer::run(
         firstProbe = "finite_loss_and_synchronized_tokens_per_second";
         return report(false, "FAIL_SUSTAINED_BENCHMARK");
     }
+
+    // Diagnostic profiling is strictly post-acceptance-measurement. It never
+    // feeds the sustained tok/s or pass/fail decision above.
+    mark("native:diagnostic_profile:start");
+    try {
+        const StageProfile profile = profileStages();
+        const double denom = std::max(profile.totalSeconds, 1.0e-12);
+        std::ostringstream out;
+        out << "{\"pass\":" << (profile.pass ? "true" : "false")
+            << ",\"diagnostic_only\":true"
+            << ",\"used_for_acceptance\":false"
+            << ",\"synchronization_between_stages\":true"
+            << ",\"warmup_steps\":" << profile.warmupSteps
+            << ",\"profiled_steps\":" << profile.profiledSteps
+            << ",\"forward_seconds\":" << profile.forwardSeconds
+            << ",\"backward_seconds\":" << profile.backwardSeconds
+            << ",\"grad_norm_seconds\":" << profile.gradNormSeconds
+            << ",\"adamw_seconds\":" << profile.adamwSeconds
+            << ",\"total_seconds\":" << profile.totalSeconds
+            << ",\"forward_fraction\":" << (profile.forwardSeconds / denom)
+            << ",\"backward_fraction\":" << (profile.backwardSeconds / denom)
+            << ",\"grad_norm_fraction\":" << (profile.gradNormSeconds / denom)
+            << ",\"adamw_fraction\":" << (profile.adamwSeconds / denom)
+            << "}";
+        profileJson = out.str();
+    } catch (const std::exception& error) {
+        profileJson = std::string("{\"pass\":false,\"diagnostic_only\":true,") +
+            "\"used_for_acceptance\":false,\"error\":\"" +
+            jsonEscape(error.what()) + "\"}";
+    }
+    mark("native:diagnostic_profile:done");
     mark("native:all_gates:pass");
     return report(true, "PASS");
 }
