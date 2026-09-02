@@ -3394,6 +3394,241 @@ NativePilotResult NativeTrainer::runPilot(const PilotPackageData& pilot) {
     return NativePilotResult{allPass, out.str()};
 }
 
+
+NativeStageResult NativeTrainer::runStage(const StagePackageData& stage) {
+    mark("native:production:initialize:start");
+    initializeSlots();
+    initializeInputs();
+    initializeActivations();
+
+    const ProbeError weightError = validateWeightLoad();
+    req(std::isfinite(weightError.maxAbs) && weightError.maxAbs == 0.0,
+        "production source weight-load verification failed");
+
+    // Always measure the immutable source baseline before any resume state is
+    // loaded. This keeps the final stage report self-contained even after a
+    // process restart.
+    mark("native:production:source_baseline:start");
+    const double baselineV3 =
+        evaluateCe(stage.v3Validation, stage.v3EvalIndices);
+    const double baselineV1 =
+        evaluateCe(stage.v1Validation, stage.v1EvalIndices);
+    mark("native:production:source_baseline:done");
+
+    const std::string recipePrefix = stage.recipeSha256.substr(0, 12);
+    const std::string checkpointPath =
+        workDirectory_ + "/model0001-foundation-v3-" +
+        recipePrefix + ".atnckpt";
+    const std::string progressPath =
+        workDirectory_ + "/model0001-production-progress.json";
+    const std::string completedPath =
+        workDirectory_ + "/model0001-production-completed.json";
+
+    bool resumed = false;
+    if (regularFileExists(checkpointPath)) {
+        mark("native:production:resume:load_checkpoint");
+        loadCheckpoint(checkpointPath);
+        resumed = true;
+    } else {
+        mark("native:production:fresh_zero_reset");
+        resetToSourceState();
+    }
+    req(optimizerStep_ <= static_cast<uint64_t>(stage.totalUpdates),
+        "production checkpoint step exceeds recipe");
+    const uint64_t startingStep = optimizerStep_;
+
+    double latestV3 = std::numeric_limits<double>::quiet_NaN();
+    double latestV1 = std::numeric_limits<double>::quiet_NaN();
+    int latestEvalStep = -1;
+    double latestTrainLoss = std::numeric_limits<double>::quiet_NaN();
+    double latestGradNorm = std::numeric_limits<double>::quiet_NaN();
+    double latestLr = startingStep < static_cast<uint64_t>(stage.totalUpdates)
+        ? stageLearningRate(stage, static_cast<int>(startingStep))
+        : stageLearningRate(stage, stage.totalUpdates - 1);
+    size_t latestCheckpointBytes = 0;
+
+    const auto sessionStarted = std::chrono::steady_clock::now();
+
+    auto writeProgress = [&](bool complete) {
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds =
+            std::chrono::duration<double>(now - sessionStarted).count();
+        const uint64_t sessionUpdates = optimizerStep_ - startingStep;
+        const double tps = sessionUpdates > 0
+            ? static_cast<double>(sessionUpdates) * S /
+                std::max(seconds, 1.0e-9)
+            : 0.0;
+        std::ostringstream out;
+        out << "{\"schema\":\"model0001_native_stage_progress_v1\""
+            << ",\"stage_name\":\"" << jsonEscape(stage.stageName) << "\""
+            << ",\"recipe_sha256\":\"" << stage.recipeSha256 << "\""
+            << ",\"resumed\":" << (resumed ? "true" : "false")
+            << ",\"starting_optimizer_step\":" << startingStep
+            << ",\"optimizer_step\":" << optimizerStep_
+            << ",\"total_updates\":" << stage.totalUpdates
+            << ",\"fraction_complete\":"
+            << (static_cast<double>(optimizerStep_) /
+                static_cast<double>(stage.totalUpdates))
+            << ",\"lifetime_tokens\":"
+            << (static_cast<uint64_t>(stage.startLifetimeTokens) +
+                optimizerStep_ * S)
+            << ",\"learning_rate\":" << std::setprecision(17) << latestLr
+            << ",\"last_train_loss\":";
+        if (std::isfinite(latestTrainLoss)) out << latestTrainLoss;
+        else out << "null";
+        out << ",\"last_global_grad_norm\":";
+        if (std::isfinite(latestGradNorm)) out << latestGradNorm;
+        else out << "null";
+        out << ",\"latest_eval_step\":" << latestEvalStep
+            << ",\"latest_v3_validation_ce\":";
+        if (std::isfinite(latestV3)) out << latestV3;
+        else out << "null";
+        out << ",\"latest_v1_validation_ce\":";
+        if (std::isfinite(latestV1)) out << latestV1;
+        else out << "null";
+        out << ",\"session_wall_seconds\":" << seconds
+            << ",\"session_wall_tokens_per_second\":" << tps
+            << ",\"checkpoint_path\":\"" << jsonEscape(checkpointPath) << "\""
+            << ",\"complete\":" << (complete ? "true" : "false")
+            << "}";
+        const std::string text = out.str();
+        atomicWrite(progressPath, text.data(), text.size());
+    };
+
+    writeProgress(startingStep == static_cast<uint64_t>(stage.totalUpdates));
+
+    for (int step = static_cast<int>(startingStep);
+         step < stage.totalUpdates; ++step) {
+        mark("native:production:train:step:" + std::to_string(step + 1));
+        const int windowIndex = step;
+        req(windowIndex < stage.train.fullWindows,
+            "production window index exceeds Dataset-v3");
+        setWindowFromU16(stage.train, windowIndex);
+        latestLr = stageLearningRate(stage, step);
+        setLearningRate(static_cast<float>(latestLr));
+        fullTrainingStep();
+
+        const int completed = step + 1;
+        const bool logDue =
+            completed % stage.logEvery == 0;
+        const bool evalDue =
+            completed % stage.evalEvery == 0 &&
+            completed < stage.totalUpdates;
+        const bool checkpointDue =
+            completed % stage.checkpointEvery == 0 &&
+            completed < stage.totalUpdates;
+        if (logDue || evalDue || checkpointDue ||
+            completed == stage.totalUpdates) {
+            latestTrainLoss = static_cast<double>(readLoss());
+            latestGradNorm = static_cast<double>(readGlobalNorm());
+        }
+
+        if (evalDue) {
+            mark("native:production:evaluate:step:" +
+                 std::to_string(completed));
+            latestV3 =
+                evaluateCe(stage.v3Validation, stage.v3EvalIndices);
+            latestV1 =
+                evaluateCe(stage.v1Validation, stage.v1EvalIndices);
+            latestEvalStep = completed;
+        }
+
+        if (checkpointDue) {
+            mark("native:production:checkpoint:step:" +
+                 std::to_string(completed));
+            saveCheckpoint(checkpointPath, &latestCheckpointBytes);
+        }
+
+        if (logDue || evalDue || checkpointDue) {
+            writeProgress(false);
+        }
+    }
+
+    req(optimizerStep_ == static_cast<uint64_t>(stage.totalUpdates),
+        "production stage ended at wrong optimizer step");
+
+    mark("native:production:final_evaluation");
+    latestV3 = evaluateCe(stage.v3Validation, stage.v3EvalIndices);
+    latestV1 = evaluateCe(stage.v1Validation, stage.v1EvalIndices);
+    latestEvalStep = stage.totalUpdates;
+
+    mark("native:production:final_checkpoint");
+    saveCheckpoint(checkpointPath, &latestCheckpointBytes);
+    runtime_.finish();
+
+    const auto sessionStopped = std::chrono::steady_clock::now();
+    const double sessionSeconds = std::chrono::duration<double>(
+        sessionStopped - sessionStarted).count();
+    const uint64_t sessionUpdates = optimizerStep_ - startingStep;
+    const double sessionTps = sessionUpdates > 0
+        ? static_cast<double>(sessionUpdates) * S /
+            std::max(sessionSeconds, 1.0e-9)
+        : 0.0;
+    const uint64_t endLifetime =
+        static_cast<uint64_t>(stage.startLifetimeTokens) +
+        optimizerStep_ * S;
+
+    const bool pass =
+        std::isfinite(baselineV3) &&
+        std::isfinite(baselineV1) &&
+        std::isfinite(latestV3) &&
+        std::isfinite(latestV1) &&
+        optimizerStep_ == static_cast<uint64_t>(stage.totalUpdates) &&
+        latestCheckpointBytes > 0;
+
+    std::ostringstream out;
+    out << "{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\""
+        << ",\"schema\":\"model0001_native_stage_report_v1\""
+        << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+        << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
+        << ",\"stage_name\":\"" << jsonEscape(stage.stageName) << "\""
+        << ",\"recipe_sha256\":\"" << stage.recipeSha256 << "\""
+        << ",\"source_model_state_sha256\":"
+        << "\"047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d\""
+        << ",\"resumed\":" << (resumed ? "true" : "false")
+        << ",\"starting_optimizer_step\":" << startingStep
+        << ",\"ending_optimizer_step\":" << optimizerStep_
+        << ",\"total_updates\":" << stage.totalUpdates
+        << ",\"stage_target_tokens\":"
+        << (static_cast<uint64_t>(stage.totalUpdates) * S)
+        << ",\"start_lifetime_tokens\":" << stage.startLifetimeTokens
+        << ",\"end_lifetime_tokens\":" << endLifetime
+        << ",\"optimizer_init\":\"fresh_zero_moments\""
+        << ",\"baseline\":{\"v3_validation_ce\":"
+        << std::setprecision(17) << baselineV3
+        << ",\"v1_validation_ce\":" << baselineV1 << "}"
+        << ",\"final\":{\"v3_validation_ce\":" << latestV3
+        << ",\"v3_validation_delta\":" << (latestV3 - baselineV3)
+        << ",\"v1_validation_ce\":" << latestV1
+        << ",\"v1_validation_delta\":" << (latestV1 - baselineV1)
+        << ",\"last_train_loss\":";
+    if (std::isfinite(latestTrainLoss)) out << latestTrainLoss;
+    else out << "null";
+    out << ",\"last_global_grad_norm\":";
+    if (std::isfinite(latestGradNorm)) out << latestGradNorm;
+    else out << "null";
+    out << "}"
+        << ",\"session_wall_seconds\":" << sessionSeconds
+        << ",\"session_wall_tokens_per_second\":" << sessionTps
+        << ",\"checkpoint\":{\"path\":\"" << jsonEscape(checkpointPath)
+        << "\",\"bytes\":" << latestCheckpointBytes << "}"
+        << ",\"progress_path\":\"" << jsonEscape(progressPath) << "\""
+        << ",\"production_lr_locked\":true"
+        << ",\"test_split_used\":false"
+        << ",\"pass\":" << (pass ? "true" : "false") << "}";
+
+    const std::string resultJson = out.str();
+    writeProgress(pass);
+    if (pass) {
+        atomicWrite(
+            completedPath, resultJson.data(), resultJson.size());
+        mark("native:production:complete");
+    } else {
+        mark("native:production:fail");
+    }
+    return NativeStageResult{pass, resultJson};
+}
+
 NativeGateResult NativeTrainer::run(
     const std::function<double()>& cpuBaseline) {
     initializeSlots();
