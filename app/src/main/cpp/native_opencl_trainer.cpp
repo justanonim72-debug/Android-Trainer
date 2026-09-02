@@ -630,6 +630,7 @@ struct OpenClApi {
     decltype(&clEnqueueReadBuffer) EnqueueReadBuffer = nullptr;
     decltype(&clEnqueueFillBuffer) EnqueueFillBuffer = nullptr;
     decltype(&clEnqueueNDRangeKernel) EnqueueNDRangeKernel = nullptr;
+    decltype(&clGetEventProfilingInfo) GetEventProfilingInfo = nullptr;
     decltype(&clFinish) Finish = nullptr;
 
     template <class T>
@@ -664,6 +665,7 @@ struct OpenClApi {
         symbol(EnqueueReadBuffer, "clEnqueueReadBuffer");
         symbol(EnqueueFillBuffer, "clEnqueueFillBuffer");
         symbol(EnqueueNDRangeKernel, "clEnqueueNDRangeKernel");
+        symbol(GetEventProfilingInfo, "clGetEventProfilingInfo");
         symbol(Finish, "clFinish");
     }
 };
@@ -674,8 +676,17 @@ struct ProcessRuntime {
     cl_device_id device = nullptr;
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
+    cl_command_queue profilingQueue = nullptr;
     cl_program program = nullptr;
     std::map<std::string, cl_kernel> kernels;
+
+    struct ProfiledEvent {
+        std::string kernel;
+        cl_event event = nullptr;
+    };
+    bool diagnosticQueueActive = false;
+    bool kernelCaptureActive = false;
+    std::vector<ProfiledEvent> profiledEvents;
     std::string deviceName;
     std::string vendor;
     std::string deviceVersion;
@@ -755,6 +766,11 @@ struct ProcessRuntime {
         req(ec == CL_SUCCESS && queue != nullptr,
             "clCreateCommandQueue failed ec=" + std::to_string(ec));
 
+        profilingQueue = api.CreateCommandQueue(
+            context, device, CL_QUEUE_PROFILING_ENABLE, &ec);
+        req(ec == CL_SUCCESS && profilingQueue != nullptr,
+            "clCreateCommandQueue profiling failed ec=" + std::to_string(ec));
+
         const char* source = kTrainerSource;
         const size_t sourceLength = std::strlen(source);
         program = api.CreateProgramWithSource(
@@ -806,6 +822,62 @@ struct ProcessRuntime {
         return it->second;
     }
 
+    cl_command_queue activeQueue() const {
+        return diagnosticQueueActive ? profilingQueue : queue;
+    }
+
+    std::string kernelName(cl_kernel value) const {
+        for (const auto& pair : kernels) {
+            if (pair.second == value) return pair.first;
+        }
+        return "unknown";
+    }
+
+    void beginDiagnosticQueue() {
+        req(!kernelCaptureActive, "cannot switch diagnostic queue during capture");
+        diagnosticQueueActive = true;
+    }
+
+    void endDiagnosticQueue() {
+        req(!kernelCaptureActive, "cannot leave diagnostic queue during capture");
+        diagnosticQueueActive = false;
+    }
+
+    void beginKernelCapture() {
+        req(diagnosticQueueActive,
+            "kernel capture requires profiling-enabled diagnostic queue");
+        req(!kernelCaptureActive, "kernel capture already active");
+        profiledEvents.clear();
+        kernelCaptureActive = true;
+    }
+
+    std::map<std::string, std::pair<int, double>> endKernelCapture() {
+        req(kernelCaptureActive, "kernel capture was not active");
+        finish();
+        kernelCaptureActive = false;
+        std::map<std::string, std::pair<int, double>> totals;
+        for (const auto& item : profiledEvents) {
+            req(item.event != nullptr, "null OpenCL profiling event");
+            cl_ulong start = 0, end = 0;
+            cl_int ec = api.GetEventProfilingInfo(
+                item.event, CL_PROFILING_COMMAND_START,
+                sizeof(start), &start, nullptr);
+            req(ec == CL_SUCCESS,
+                "clGetEventProfilingInfo(start) failed ec=" + std::to_string(ec));
+            ec = api.GetEventProfilingInfo(
+                item.event, CL_PROFILING_COMMAND_END,
+                sizeof(end), &end, nullptr);
+            req(ec == CL_SUCCESS && end >= start,
+                "clGetEventProfilingInfo(end) failed ec=" + std::to_string(ec));
+            auto& aggregate = totals[item.kernel];
+            aggregate.first += 1;
+            aggregate.second += static_cast<double>(end - start) * 1.0e-9;
+        }
+        // Deliberately do not clReleaseEvent here. This process-long diagnostic
+        // path follows the existing Mali no-teardown policy and runs once.
+        return totals;
+    }
+
     cl_mem allocate(size_t bytes, cl_mem_flags flags = CL_MEM_READ_WRITE) {
         req(bytes > 0 && static_cast<cl_ulong>(bytes) <= maxAllocation,
             "OpenCL buffer exceeds CL_DEVICE_MAX_MEM_ALLOC_SIZE: " +
@@ -820,14 +892,14 @@ struct ProcessRuntime {
 
     void write(cl_mem buffer, const void* data, size_t bytes, size_t offset = 0) {
         cl_int ec = api.EnqueueWriteBuffer(
-            queue, buffer, CL_TRUE, offset, bytes, data, 0, nullptr, nullptr);
+            activeQueue(), buffer, CL_TRUE, offset, bytes, data, 0, nullptr, nullptr);
         req(ec == CL_SUCCESS,
             "clEnqueueWriteBuffer failed ec=" + std::to_string(ec));
     }
 
     void read(cl_mem buffer, void* data, size_t bytes, size_t offset = 0) {
         cl_int ec = api.EnqueueReadBuffer(
-            queue, buffer, CL_TRUE, offset, bytes, data, 0, nullptr, nullptr);
+            activeQueue(), buffer, CL_TRUE, offset, bytes, data, 0, nullptr, nullptr);
         req(ec == CL_SUCCESS,
             "clEnqueueReadBuffer failed ec=" + std::to_string(ec));
     }
@@ -835,7 +907,7 @@ struct ProcessRuntime {
     void zero(cl_mem buffer, size_t bytes) {
         const float value = 0.0f;
         cl_int ec = api.EnqueueFillBuffer(
-            queue, buffer, &value, sizeof(value), 0, bytes, 0, nullptr, nullptr);
+            activeQueue(), buffer, &value, sizeof(value), 0, bytes, 0, nullptr, nullptr);
         req(ec == CL_SUCCESS,
             "clEnqueueFillBuffer failed ec=" + std::to_string(ec));
     }
@@ -852,23 +924,37 @@ struct ProcessRuntime {
     void enqueue1(cl_kernel kernelValue, size_t count, size_t local = 64) {
         req(local > 0 && local <= maxWorkGroup, "invalid 1-D local size");
         const size_t global = roundUp(std::max<size_t>(count, 1), local);
+        cl_event event = nullptr;
+        cl_event* eventOut = kernelCaptureActive ? &event : nullptr;
         cl_int ec = api.EnqueueNDRangeKernel(
-            queue, kernelValue, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+            activeQueue(), kernelValue, 1, nullptr, &global, &local,
+            0, nullptr, eventOut);
         req(ec == CL_SUCCESS,
             "clEnqueueNDRangeKernel(1D) failed ec=" + std::to_string(ec));
+        if (kernelCaptureActive) {
+            req(event != nullptr, "OpenCL 1D profiling event missing");
+            profiledEvents.push_back({kernelName(kernelValue), event});
+        }
     }
 
     void enqueue2(cl_kernel kernelValue, size_t x, size_t y) {
         const size_t global[2] = {roundUp(x, TILE), roundUp(y, TILE)};
         const size_t local[2] = {TILE, TILE};
+        cl_event event = nullptr;
+        cl_event* eventOut = kernelCaptureActive ? &event : nullptr;
         cl_int ec = api.EnqueueNDRangeKernel(
-            queue, kernelValue, 2, nullptr, global, local, 0, nullptr, nullptr);
+            activeQueue(), kernelValue, 2, nullptr, global, local,
+            0, nullptr, eventOut);
         req(ec == CL_SUCCESS,
             "clEnqueueNDRangeKernel(2D) failed ec=" + std::to_string(ec));
+        if (kernelCaptureActive) {
+            req(event != nullptr, "OpenCL 2D profiling event missing");
+            profiledEvents.push_back({kernelName(kernelValue), event});
+        }
     }
 
     void finish() {
-        cl_int ec = api.Finish(queue);
+        cl_int ec = api.Finish(activeQueue());
         req(ec == CL_SUCCESS, "clFinish failed ec=" + std::to_string(ec));
     }
 
@@ -1142,6 +1228,7 @@ private:
     void loadCheckpoint(const std::string& path);
     BenchmarkGate benchmark(const std::function<double()>& cpuBaseline);
     StageProfile profileStages();
+    std::string profileKernelsJson();
     std::string memoryJson() const;
 };
 
@@ -2429,6 +2516,73 @@ StageProfile NativeTrainer::profileStages() {
     return profile;
 }
 
+std::string NativeTrainer::profileKernelsJson() {
+    // This is a second, diagnostic-only profiling pass. It uses a dedicated
+    // CL_QUEUE_PROFILING_ENABLE queue so official sustained timing above stays
+    // on the original non-profiling queue.
+    resetToSourceState();
+    runtime_.beginDiagnosticQueue();
+    try {
+        // Warm the dedicated queue without collecting events, then restore the
+        // immutable source state so capture starts from optimizer step zero.
+        fullTrainingStep();
+        runtime_.finish();
+        resetToSourceState();
+
+        runtime_.beginKernelCapture();
+        fullTrainingStep();
+        const auto totals = runtime_.endKernelCapture();
+        runtime_.endDiagnosticQueue();
+
+        struct Row {
+            std::string name;
+            int count = 0;
+            double seconds = 0.0;
+        };
+        std::vector<Row> rows;
+        double totalKernelSeconds = 0.0;
+        int totalEvents = 0;
+        for (const auto& pair : totals) {
+            rows.push_back({pair.first, pair.second.first, pair.second.second});
+            totalKernelSeconds += pair.second.second;
+            totalEvents += pair.second.first;
+        }
+        std::sort(rows.begin(), rows.end(),
+            [](const Row& a, const Row& b) { return a.seconds > b.seconds; });
+
+        std::ostringstream out;
+        out << "{\"pass\":true"
+            << ",\"diagnostic_only\":true"
+            << ",\"used_for_acceptance\":false"
+            << ",\"queue_profiling_enabled\":true"
+            << ",\"profiled_full_steps\":1"
+            << ",\"event_count\":" << totalEvents
+            << ",\"total_kernel_seconds\":" << totalKernelSeconds
+            << ",\"kernels\":[";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i) out << ",";
+            const double fraction = totalKernelSeconds > 0.0
+                ? rows[i].seconds / totalKernelSeconds : 0.0;
+            out << "{\"name\":\"" << jsonEscape(rows[i].name)
+                << "\",\"count\":" << rows[i].count
+                << ",\"seconds\":" << rows[i].seconds
+                << ",\"fraction\":" << fraction << "}";
+        }
+        out << "]}";
+        return out.str();
+    } catch (...) {
+        // Restore the official queue even if diagnostic profiling fails.
+        // Diagnostic failure must never invalidate the already-completed gate.
+        try {
+            if (runtime_.kernelCaptureActive) {
+                (void)runtime_.endKernelCapture();
+            }
+        } catch (...) {}
+        try { runtime_.endDiagnosticQueue(); } catch (...) {}
+        throw;
+    }
+}
+
 std::string NativeTrainer::memoryJson() const {
     const size_t total = persistentBytes_ + activationBytes_ + workspaceBytes_;
     std::ostringstream out;
@@ -2681,6 +2835,7 @@ NativeGateResult NativeTrainer::run(
     mark("native:diagnostic_profile:start");
     try {
         const StageProfile profile = profileStages();
+        const std::string kernelProfile = profileKernelsJson();
         const double denom = std::max(profile.totalSeconds, 1.0e-12);
         std::ostringstream out;
         out << "{\"pass\":" << (profile.pass ? "true" : "false")
@@ -2698,6 +2853,7 @@ NativeGateResult NativeTrainer::run(
             << ",\"backward_fraction\":" << (profile.backwardSeconds / denom)
             << ",\"grad_norm_fraction\":" << (profile.gradNormSeconds / denom)
             << ",\"adamw_fraction\":" << (profile.adamwSeconds / denom)
+            << ",\"kernel_profile\":" << kernelProfile
             << "}";
         profileJson = out.str();
     } catch (const std::exception& error) {
