@@ -1620,6 +1620,7 @@ public:
 
     NativeGateResult run(const std::function<double()>& cpuBaseline);
     NativePilotResult runPilot(const PilotPackageData& pilot);
+    NativeStageResult runStage(const StagePackageData& stage);
     const std::string& currentStage() const { return currentStage_; }
 
 private:
