@@ -125,6 +125,7 @@ __kernel void rmsnorm_dx(
     __global const float* w,
     __global const float* dy,
     __global float* dx,
+    __global float* inv_rows,
     int rows,
     int d,
     float eps) {
@@ -137,6 +138,7 @@ __kernel void rmsnorm_dx(
         ss += z * z;
     }
     float inv = rsqrt(ss / (float)d + eps);
+    inv_rows[row] = inv;
     float dot = 0.0f;
     for (int j = 0; j < d; ++j) dot += dy[base + j] * w[j] * x[base + j];
     float corr = dot * (inv * inv * inv) / (float)d;
@@ -148,22 +150,16 @@ __kernel void rmsnorm_dx(
 __kernel void rmsnorm_dw(
     __global const float* x,
     __global const float* dy,
+    __global const float* inv_rows,
     __global float* dw,
     int rows,
-    int d,
-    float eps) {
+    int d) {
     int col = (int)get_global_id(0);
     if (col >= d) return;
     float acc = 0.0f;
     for (int row = 0; row < rows; ++row) {
         int base = row * d;
-        float ss = 0.0f;
-        for (int j = 0; j < d; ++j) {
-            float z = x[base + j];
-            ss += z * z;
-        }
-        float inv = rsqrt(ss / (float)d + eps);
-        acc += dy[base + col] * x[base + col] * inv;
+        acc += dy[base + col] * x[base + col] * inv_rows[row];
     }
     dw[col] = acc;
 }
@@ -1116,6 +1112,22 @@ private:
 
     std::array<cl_mem, LAYERS> layerInput_{};
     std::array<cl_mem, LAYERS> layerAttn_{};
+
+    // Retain the backward-critical forward activations. The previous gate
+    // recomputed a complete attention+FFN subgraph inside every backward layer;
+    // profiling proved that recompute alone consumed a material fraction of
+    // backward time. Model #0001 has ample memory headroom, so trade ~54 MiB
+    // for eliminating that repeated compute.
+    std::array<cl_mem, LAYERS> retainedQRoPe_{};
+    std::array<cl_mem, LAYERS> retainedKRepeat_{};
+    std::array<cl_mem, LAYERS> retainedVRepeat_{};
+    std::array<cl_mem, LAYERS> retainedProbability_{};
+    std::array<cl_mem, LAYERS> retainedAttentionFlat_{};
+    std::array<cl_mem, LAYERS> retainedFfnNorm_{};
+    std::array<cl_mem, LAYERS> retainedGate_{};
+    std::array<cl_mem, LAYERS> retainedUp_{};
+    std::array<cl_mem, LAYERS> retainedFf_{};
+
     cl_mem modelOutput_ = nullptr;
     cl_mem finalNormalized_ = nullptr;
     cl_mem logits_ = nullptr;
@@ -1153,6 +1165,7 @@ private:
     cl_mem dV_ = nullptr;
     cl_mem normPartials_ = nullptr;
     cl_mem globalNorm_ = nullptr;
+    cl_mem rmsInvRows_ = nullptr;
     cl_mem probeIndices_ = nullptr;
     cl_mem probeOutput_ = nullptr;
 
@@ -1420,6 +1433,17 @@ void NativeTrainer::initializeActivations() {
     for (int layer = 0; layer < LAYERS; ++layer) {
         layerInput_[layer] = allocateElements(sd, &activationBytes_);
         layerAttn_[layer] = allocateElements(sd, &activationBytes_);
+        retainedQRoPe_[layer] = allocateElements(sh, &activationBytes_);
+        retainedKRepeat_[layer] = allocateElements(sh, &activationBytes_);
+        retainedVRepeat_[layer] = allocateElements(sh, &activationBytes_);
+        retainedProbability_[layer] =
+            allocateElements(attention, &activationBytes_);
+        retainedAttentionFlat_[layer] =
+            allocateElements(sd, &activationBytes_);
+        retainedFfnNorm_[layer] = allocateElements(sd, &activationBytes_);
+        retainedGate_[layer] = allocateElements(sff, &activationBytes_);
+        retainedUp_[layer] = allocateElements(sff, &activationBytes_);
+        retainedFf_[layer] = allocateElements(sff, &activationBytes_);
     }
     modelOutput_ = allocateElements(sd, &activationBytes_);
     finalNormalized_ = allocateElements(sd, &activationBytes_);
@@ -1459,6 +1483,7 @@ void NativeTrainer::initializeActivations() {
     normPartials_ = allocateElements(
         slots_.size() * REDUCE_GROUPS, &workspaceBytes_);
     globalNorm_ = allocateElements(1, &workspaceBytes_);
+    rmsInvRows_ = allocateElements(S, &workspaceBytes_);
     probeIndices_ = runtime_.allocate(4096 * sizeof(int32_t));
     probeOutput_ = allocateElements(4096, &workspaceBytes_);
 }
@@ -1522,18 +1547,19 @@ void NativeTrainer::rmsBackward(
     runtime_.argument(kdx, 1, weight.parameter);
     runtime_.argument(kdx, 2, dy);
     runtime_.argument(kdx, 3, dx);
-    runtime_.argument(kdx, 4, rows);
-    runtime_.argument(kdx, 5, d);
-    runtime_.argument(kdx, 6, eps);
+    runtime_.argument(kdx, 4, rmsInvRows_);
+    runtime_.argument(kdx, 5, rows);
+    runtime_.argument(kdx, 6, d);
+    runtime_.argument(kdx, 7, eps);
     runtime_.enqueue1(kdx, rows);
 
     cl_kernel kdw = runtime_.kernel("rmsnorm_dw");
     runtime_.argument(kdw, 0, x);
     runtime_.argument(kdw, 1, dy);
-    runtime_.argument(kdw, 2, weight.gradient);
-    runtime_.argument(kdw, 3, rows);
-    runtime_.argument(kdw, 4, d);
-    runtime_.argument(kdw, 5, eps);
+    runtime_.argument(kdw, 2, rmsInvRows_);
+    runtime_.argument(kdw, 3, weight.gradient);
+    runtime_.argument(kdw, 4, rows);
+    runtime_.argument(kdw, 5, d);
     runtime_.enqueue1(kdw, d);
 }
 
@@ -1734,36 +1760,43 @@ void NativeTrainer::forward() {
         splitHeads(attentionFlat_, k_, HKV);
         linearForward(norm_, layer.v->parameter, attentionFlat_, S, D, HKV * HD);
         splitHeads(attentionFlat_, v_, HKV);
-        ropeForward(q_, qRope_, HQ);
+        ropeForward(q_, retainedQRoPe_[layerIndex], HQ);
         ropeForward(k_, kRope_, HKV);
-        repeatKv(kRope_, kRepeat_);
-        repeatKv(v_, vRepeat_);
-        bmmNt(qRope_, kRepeat_, scores_, HQ, S, S, HD,
+        repeatKv(kRope_, retainedKRepeat_[layerIndex]);
+        repeatKv(v_, retainedVRepeat_[layerIndex]);
+        bmmNt(retainedQRoPe_[layerIndex], retainedKRepeat_[layerIndex],
+            scores_, HQ, S, S, HD,
             1.0f / std::sqrt(static_cast<float>(HD)));
 
         const int attentionRows = HQ * S, seq = S;
         cl_kernel softmax = runtime_.kernel("causal_softmax_forward");
         runtime_.argument(softmax, 0, scores_);
-        runtime_.argument(softmax, 1, probability_);
+        runtime_.argument(softmax, 1, retainedProbability_[layerIndex]);
         runtime_.argument(softmax, 2, attentionRows);
         runtime_.argument(softmax, 3, seq);
         runtime_.enqueue1(softmax, attentionRows);
-        bmmNn(probability_, vRepeat_, context_, HQ, S, S, HD, 1.0f);
-        mergeHeads(context_, attentionFlat_, HQ);
-        linearForward(attentionFlat_, layer.o->parameter, tempD_, S, D, D);
+        bmmNn(retainedProbability_[layerIndex], retainedVRepeat_[layerIndex],
+            context_, HQ, S, S, HD, 1.0f);
+        mergeHeads(context_, retainedAttentionFlat_[layerIndex], HQ);
+        linearForward(retainedAttentionFlat_[layerIndex],
+            layer.o->parameter, tempD_, S, D, D);
         add(input, tempD_, layerAttn_[layerIndex], sd);
 
-        rmsForward(layerAttn_[layerIndex], *layer.ffnNorm, norm_);
-        linearForward(norm_, layer.gate->parameter, gate_, S, D, FF);
-        linearForward(norm_, layer.up->parameter, up_, S, D, FF);
+        rmsForward(layerAttn_[layerIndex], *layer.ffnNorm,
+            retainedFfnNorm_[layerIndex]);
+        linearForward(retainedFfnNorm_[layerIndex], layer.gate->parameter,
+            retainedGate_[layerIndex], S, D, FF);
+        linearForward(retainedFfnNorm_[layerIndex], layer.up->parameter,
+            retainedUp_[layerIndex], S, D, FF);
         const int ffCount = S * FF;
         cl_kernel silu = runtime_.kernel("silu_multiply");
-        runtime_.argument(silu, 0, gate_);
-        runtime_.argument(silu, 1, up_);
-        runtime_.argument(silu, 2, ff_);
+        runtime_.argument(silu, 0, retainedGate_[layerIndex]);
+        runtime_.argument(silu, 1, retainedUp_[layerIndex]);
+        runtime_.argument(silu, 2, retainedFf_[layerIndex]);
         runtime_.argument(silu, 3, ffCount);
         runtime_.enqueue1(silu, ffCount);
-        linearForward(ff_, layer.down->parameter, tempD_, S, FF, D);
+        linearForward(retainedFf_[layerIndex],
+            layer.down->parameter, tempD_, S, FF, D);
         cl_mem output = layerIndex + 1 < LAYERS
             ? layerInput_[layerIndex + 1]
             : modelOutput_;
@@ -1806,26 +1839,27 @@ void NativeTrainer::backward() {
 
     for (int layerIndex = LAYERS - 1; layerIndex >= 0; --layerIndex) {
         auto& layer = layers_[layerIndex];
-        recomputeLayer(layerIndex);
 
         // FFN residual branch.
-        linearDWeight(current, ff_, layer.down->gradient, S, FF, D);
+        linearDWeight(current, retainedFf_[layerIndex],
+            layer.down->gradient, S, FF, D);
         linearDInput(current, layer.down->parameter, dFf_, S, FF, D);
 
         const int ffCount = S * FF;
         cl_kernel siluBackward = runtime_.kernel("silu_multiply_backward");
-        runtime_.argument(siluBackward, 0, gate_);
-        runtime_.argument(siluBackward, 1, up_);
+        runtime_.argument(siluBackward, 0, retainedGate_[layerIndex]);
+        runtime_.argument(siluBackward, 1, retainedUp_[layerIndex]);
         runtime_.argument(siluBackward, 2, dFf_);
         runtime_.argument(siluBackward, 3, tempFf_); // dGate
-        runtime_.argument(siluBackward, 4, ff_);     // dUp; ff no longer needed
+        runtime_.argument(siluBackward, 4, ff_);     // dUp scratch
         runtime_.argument(siluBackward, 5, ffCount);
         runtime_.enqueue1(siluBackward, ffCount);
 
-        // recomputeLayer leaves the FFN-normalized activation in norm_.
-        linearDWeight(tempFf_, norm_, layer.gate->gradient, S, D, FF);
+        linearDWeight(tempFf_, retainedFfnNorm_[layerIndex],
+            layer.gate->gradient, S, D, FF);
         linearDInput(tempFf_, layer.gate->parameter, tempD_, S, D, FF);
-        linearDWeight(ff_, norm_, layer.up->gradient, S, D, FF);
+        linearDWeight(ff_, retainedFfnNorm_[layerIndex],
+            layer.up->gradient, S, D, FF);
         linearDInput(ff_, layer.up->parameter, dContext_, S, D, FF);
         addInPlace(tempD_, dContext_, sd);
         rmsBackward(
@@ -1835,7 +1869,7 @@ void NativeTrainer::backward() {
 
         // Attention residual branch.
         linearDWeight(
-            ffnResidualGradient, attentionFlat_,
+            ffnResidualGradient, retainedAttentionFlat_[layerIndex],
             layer.o->gradient, S, D, D);
         linearDInput(
             ffnResidualGradient, layer.o->parameter,
@@ -1844,25 +1878,28 @@ void NativeTrainer::backward() {
 
         // dProbability = dContext * V^T.
         bmmNt(
-            dContext_, vRepeat_, dProbability_, HQ, S, S, HD, 1.0f);
+            dContext_, retainedVRepeat_[layerIndex],
+            dProbability_, HQ, S, S, HD, 1.0f);
         // dV = Probability^T * dContext.
         bmmLeftT(
-            probability_, dContext_, dVRepeat_, HQ, S, S, HD, 1.0f);
+            retainedProbability_[layerIndex], dContext_,
+            dVRepeat_, HQ, S, S, HD, 1.0f);
 
         const int attentionRows = HQ * S, seq = S;
         cl_kernel softmaxBackward =
             runtime_.kernel("causal_softmax_backward");
-        runtime_.argument(softmaxBackward, 0, probability_);
+        runtime_.argument(
+            softmaxBackward, 0, retainedProbability_[layerIndex]);
         runtime_.argument(softmaxBackward, 1, dProbability_);
         runtime_.argument(softmaxBackward, 2, attentionRows);
         runtime_.argument(softmaxBackward, 3, seq);
         runtime_.enqueue1(softmaxBackward, attentionRows);
 
         bmmNn(
-            dProbability_, kRepeat_, dQ_,
+            dProbability_, retainedKRepeat_[layerIndex], dQ_,
             HQ, S, S, HD, attentionScale);
         bmmLeftT(
-            dProbability_, qRope_, dKRepeat_,
+            dProbability_, retainedQRoPe_[layerIndex], dKRepeat_,
             HQ, S, S, HD, attentionScale);
         reduceGqa(dKRepeat_, dK_);
         reduceGqa(dVRepeat_, dV_);
