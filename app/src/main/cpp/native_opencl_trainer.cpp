@@ -1384,6 +1384,231 @@ PilotPackageData loadPilotPackage(const std::string& root) {
     return result;
 }
 
+
+struct StagePackageData {
+    std::string recipeSha256;
+    std::string stageName;
+    int totalUpdates = 0;
+    int startLifetimeTokens = 0;
+    int checkpointEvery = 0;
+    int evalEvery = 0;
+    int logEvery = 0;
+    bool constantSchedule = false;
+    double peakLr = 0.0;
+    double minLr = 0.0;
+    int warmupSteps = 0;
+    PilotDataFile train;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+};
+
+StagePackageData loadStagePackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid stage manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_native_stage_package_v2",
+        "unsupported stage package schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d",
+        "stage source model SHA mismatch");
+    req(doc.HasMember("recipe_sha256") && doc["recipe_sha256"].IsString(),
+        "stage recipe SHA missing");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "stage hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "stage package contains test split");
+    req(guards.HasMember("dataset_v2_train_bin_packaged") &&
+            guards["dataset_v2_train_bin_packaged"].IsBool() &&
+            !guards["dataset_v2_train_bin_packaged"].GetBool(),
+        "stage package contains Dataset-v2 train");
+
+    req(doc.HasMember("recipe") && doc["recipe"].IsObject(),
+        "stage recipe missing");
+    const auto& recipe = doc["recipe"];
+    StagePackageData result;
+    result.recipeSha256 = doc["recipe_sha256"].GetString();
+    req(result.recipeSha256.size() == 64, "stage recipe SHA length invalid");
+    for (char c : result.recipeSha256) {
+        req((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+            "stage recipe SHA is not lowercase hex");
+    }
+    req(recipe.HasMember("stage_name") && recipe["stage_name"].IsString(),
+        "stage_name missing");
+    result.stageName = recipe["stage_name"].GetString();
+    req(result.stageName == "friend_foundation_v3_cpt",
+        "production stage name drift");
+    req(recipe.HasMember("total_updates") && recipe["total_updates"].IsInt() &&
+            recipe["total_updates"].GetInt() > 0,
+        "total_updates invalid");
+    result.totalUpdates = recipe["total_updates"].GetInt();
+    req(recipe.HasMember("target_tokens_per_update") &&
+            recipe["target_tokens_per_update"].IsInt() &&
+            recipe["target_tokens_per_update"].GetInt() == S,
+        "production target tokens/update drift");
+    req(recipe.HasMember("start_lifetime_tokens") &&
+            recipe["start_lifetime_tokens"].IsInt() &&
+            recipe["start_lifetime_tokens"].GetInt() == 5535744,
+        "production lifetime boundary drift");
+    result.startLifetimeTokens = recipe["start_lifetime_tokens"].GetInt();
+    req(recipe.HasMember("optimizer_init") &&
+            recipe["optimizer_init"].IsString() &&
+            std::string(recipe["optimizer_init"].GetString()) ==
+                "fresh_zero_moments",
+        "production optimizer init drift");
+
+    req(recipe.HasMember("optimizer") && recipe["optimizer"].IsObject(),
+        "production optimizer missing");
+    const auto& optimizer = recipe["optimizer"];
+    req(optimizer.HasMember("name") && optimizer["name"].IsString() &&
+            std::string(optimizer["name"].GetString()) == "AdamW",
+        "production optimizer must be AdamW");
+    req(optimizer.HasMember("betas") && optimizer["betas"].IsArray() &&
+            optimizer["betas"].Size() == 2 &&
+            std::abs(optimizer["betas"][0].GetDouble() - 0.9) <= 1.0e-12 &&
+            std::abs(optimizer["betas"][1].GetDouble() - 0.95) <= 1.0e-12,
+        "production AdamW betas drift");
+    req(optimizer.HasMember("eps") && optimizer["eps"].IsNumber() &&
+            std::abs(optimizer["eps"].GetDouble() - 1.0e-8) <= 1.0e-16,
+        "production AdamW eps drift");
+    req(optimizer.HasMember("grad_clip") &&
+            optimizer["grad_clip"].IsNumber() &&
+            std::abs(optimizer["grad_clip"].GetDouble() - 1.0) <= 1.0e-12,
+        "production grad clip drift");
+
+    req(recipe.HasMember("sample_order") && recipe["sample_order"].IsObject(),
+        "production sample_order missing");
+    const auto& order = recipe["sample_order"];
+    req(order.HasMember("type") && order["type"].IsString() &&
+            std::string(order["type"].GetString()) ==
+                "sequential_packed_windows",
+        "production sample order drift");
+    req(order.HasMember("seed") && order["seed"].IsInt() &&
+            order["seed"].GetInt() == 20260903,
+        "production sample-order seed drift");
+
+    req(recipe.HasMember("checkpoint_every") &&
+            recipe["checkpoint_every"].IsInt() &&
+            recipe["checkpoint_every"].GetInt() > 0 &&
+            recipe.HasMember("eval_every") &&
+            recipe["eval_every"].IsInt() &&
+            recipe["eval_every"].GetInt() > 0 &&
+            recipe.HasMember("log_every") &&
+            recipe["log_every"].IsInt() &&
+            recipe["log_every"].GetInt() > 0,
+        "production cadence invalid");
+    result.checkpointEvery = recipe["checkpoint_every"].GetInt();
+    result.evalEvery = recipe["eval_every"].GetInt();
+    result.logEvery = recipe["log_every"].GetInt();
+    req(recipe.HasMember("test_split_used") &&
+            recipe["test_split_used"].IsBool() &&
+            !recipe["test_split_used"].GetBool(),
+        "production test split must remain untouched");
+
+    req(recipe.HasMember("lr_schedule") &&
+            recipe["lr_schedule"].IsObject(),
+        "production LR schedule missing");
+    const auto& schedule = recipe["lr_schedule"];
+    req(schedule.HasMember("type") && schedule["type"].IsString(),
+        "production LR schedule type missing");
+    const std::string scheduleType = schedule["type"].GetString();
+    if (scheduleType == "constant") {
+        req(schedule.HasMember("lr") && schedule["lr"].IsNumber(),
+            "constant LR missing");
+        result.constantSchedule = true;
+        result.peakLr = schedule["lr"].GetDouble();
+        result.minLr = result.peakLr;
+        result.warmupSteps = 0;
+    } else {
+        req(scheduleType == "linear_warmup_cosine",
+            "unsupported production LR schedule");
+        req(schedule.HasMember("peak_lr") && schedule["peak_lr"].IsNumber() &&
+                schedule.HasMember("min_lr") && schedule["min_lr"].IsNumber() &&
+                schedule.HasMember("warmup_steps") &&
+                schedule["warmup_steps"].IsInt(),
+            "warmup/cosine LR schedule malformed");
+        result.constantSchedule = false;
+        result.peakLr = schedule["peak_lr"].GetDouble();
+        result.minLr = schedule["min_lr"].GetDouble();
+        result.warmupSteps = schedule["warmup_steps"].GetInt();
+    }
+    req(std::isfinite(result.peakLr) && std::isfinite(result.minLr) &&
+            result.peakLr > 0.0 && result.peakLr <= 2.0e-4 &&
+            result.minLr > 0.0 && result.minLr <= result.peakLr,
+        "production LR range invalid");
+    if (!result.constantSchedule) {
+        req(result.warmupSteps > 0 &&
+                result.warmupSteps < result.totalUpdates,
+            "production warmup length invalid");
+    }
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "production data section missing");
+    const auto& data = doc["data"];
+    result.train = loadPilotDataFile(root, data, "train");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+    req(result.totalUpdates <= result.train.fullWindows,
+        "production total_updates exceeds one packed Dataset-v3 pass");
+
+    req(doc.HasMember("eval_indices") && doc["eval_indices"].IsObject(),
+        "production eval indices missing");
+    const auto& eval = doc["eval_indices"];
+    result.v3EvalIndices = readIndexArray(eval, "v3_validation");
+    result.v1EvalIndices = readIndexArray(eval, "v1_validation");
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("production eval index outside ") + label);
+        }
+    };
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows, "v3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows, "v1 validation");
+    return result;
+}
+
+double stageLearningRate(const StagePackageData& stage, int updateIndex) {
+    req(updateIndex >= 0 && updateIndex < stage.totalUpdates,
+        "production LR update index invalid");
+    if (stage.constantSchedule) return stage.peakLr;
+    const int updateNumber = updateIndex + 1;
+    if (updateNumber <= stage.warmupSteps) {
+        return stage.peakLr *
+            static_cast<double>(updateNumber) /
+            static_cast<double>(stage.warmupSteps);
+    }
+    const int decaySteps = stage.totalUpdates - stage.warmupSteps;
+    const double progress = std::min(
+        1.0,
+        std::max(
+            0.0,
+            static_cast<double>(updateNumber - stage.warmupSteps) /
+                static_cast<double>(decaySteps)));
+    constexpr double PI = 3.1415926535897932384626433832795;
+    const double cosine = 0.5 * (1.0 + std::cos(PI * progress));
+    return stage.minLr + (stage.peakLr - stage.minLr) * cosine;
+}
+
+bool regularFileExists(const std::string& path) {
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
 class NativeTrainer {
 public:
     NativeTrainer(const Bundle& bundle, std::string workDirectory)
