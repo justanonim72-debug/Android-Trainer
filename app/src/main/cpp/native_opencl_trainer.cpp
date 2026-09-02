@@ -1219,6 +1219,171 @@ struct StateProbe {
     float moment2 = 0.0f;
 };
 
+
+struct PilotDataFile {
+    std::string relativePath;
+    std::vector<uint16_t> tokens;
+    int fullWindows = 0;
+};
+
+struct PilotPackageData {
+    std::vector<double> lrCandidates;
+    std::vector<int> trainIndices;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+    int trainSteps = 0;
+    int warmupSteps = 0;
+    PilotDataFile train;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+};
+
+std::string safePilotPath(
+    const std::string& root, const std::string& relative) {
+    req(!relative.empty() && relative[0] != '/' &&
+            relative.find("..") == std::string::npos,
+        "unsafe pilot relative path");
+    return root + "/" + relative;
+}
+
+std::vector<uint16_t> readU16LeFile(const std::string& path) {
+    const auto bytes = readBinaryFile(path);
+    req(!bytes.empty() && bytes.size() % 2 == 0,
+        "pilot uint16 file has invalid byte length: " + path);
+    std::vector<uint16_t> result(bytes.size() / 2);
+    for (size_t i = 0; i < result.size(); ++i) {
+        result[i] = static_cast<uint16_t>(
+            static_cast<uint16_t>(bytes[i * 2]) |
+            (static_cast<uint16_t>(bytes[i * 2 + 1]) << 8));
+        req(result[i] < V, "pilot token out of vocabulary");
+    }
+    return result;
+}
+
+std::vector<int> readIndexArray(
+    const rapidjson::Value& parent, const char* key) {
+    req(parent.HasMember(key) && parent[key].IsArray(),
+        std::string("pilot manifest missing index array: ") + key);
+    std::vector<int> result;
+    for (const auto& value : parent[key].GetArray()) {
+        req(value.IsInt() && value.GetInt() >= 0,
+            std::string("invalid pilot index: ") + key);
+        result.push_back(value.GetInt());
+    }
+    req(!result.empty(), std::string("empty pilot index array: ") + key);
+    return result;
+}
+
+PilotDataFile loadPilotDataFile(
+    const std::string& root, const rapidjson::Value& data,
+    const char* key) {
+    req(data.HasMember(key) && data[key].IsObject(),
+        std::string("pilot data manifest missing: ") + key);
+    const auto& spec = data[key];
+    req(spec.HasMember("path") && spec["path"].IsString() &&
+            spec.HasMember("full_windows") && spec["full_windows"].IsInt() &&
+            spec.HasMember("uint16_tokens") && spec["uint16_tokens"].IsUint64(),
+        std::string("invalid pilot data spec: ") + key);
+    PilotDataFile file;
+    file.relativePath = spec["path"].GetString();
+    file.fullWindows = spec["full_windows"].GetInt();
+    req(file.fullWindows > 0, "pilot data has zero windows");
+    file.tokens = readU16LeFile(safePilotPath(root, file.relativePath));
+    req(file.tokens.size() == spec["uint16_tokens"].GetUint64(),
+        "pilot data token count mismatch");
+    req(static_cast<int>((file.tokens.size() - 1) / S) == file.fullWindows,
+        "pilot data full-window count mismatch");
+    return file;
+}
+
+PilotPackageData loadPilotPackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid pilot manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_v3_lr_pilot_v1",
+        "unsupported pilot schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d",
+        "pilot source model SHA mismatch");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "pilot hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "pilot package must not contain test split");
+    req(guards.HasMember("dataset_v2_train_bin_packaged") &&
+            guards["dataset_v2_train_bin_packaged"].IsBool() &&
+            !guards["dataset_v2_train_bin_packaged"].GetBool(),
+        "pilot package must not contain Dataset-v2 train bin");
+    req(doc.HasMember("protocol") && doc["protocol"].IsObject(),
+        "pilot protocol missing");
+    const auto& protocol = doc["protocol"];
+    req(protocol.HasMember("train_steps_per_candidate") &&
+            protocol["train_steps_per_candidate"].IsInt() &&
+            protocol.HasMember("warmup_steps") &&
+            protocol["warmup_steps"].IsInt() &&
+            protocol.HasMember("lr_candidates") &&
+            protocol["lr_candidates"].IsArray(),
+        "pilot protocol malformed");
+
+    PilotPackageData result;
+    result.trainSteps = protocol["train_steps_per_candidate"].GetInt();
+    result.warmupSteps = protocol["warmup_steps"].GetInt();
+    req(result.trainSteps == 96 && result.warmupSteps == 3,
+        "pilot step/warmup contract drift");
+    for (const auto& value : protocol["lr_candidates"].GetArray()) {
+        req(value.IsNumber(), "pilot LR candidate is not numeric");
+        const double lr = value.GetDouble();
+        req(std::isfinite(lr) && lr >= 5.0e-5 && lr <= 2.0e-4,
+            "pilot LR candidate outside locked CPT pilot range");
+        result.lrCandidates.push_back(lr);
+    }
+    req(result.lrCandidates.size() == 3,
+        "pilot must contain exactly three LR candidates");
+
+    req(doc.HasMember("indices") && doc["indices"].IsObject(),
+        "pilot indices missing");
+    const auto& indices = doc["indices"];
+    result.trainIndices = readIndexArray(indices, "train");
+    result.v3EvalIndices = readIndexArray(indices, "v3_validation");
+    result.v1EvalIndices = readIndexArray(indices, "v1_validation");
+    req(static_cast<int>(result.trainIndices.size()) == result.trainSteps,
+        "pilot train index count mismatch");
+    req(result.v3EvalIndices.size() == 24 &&
+            result.v1EvalIndices.size() == 24,
+        "pilot eval-window count drift");
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "pilot data section missing");
+    const auto& data = doc["data"];
+    result.train = loadPilotDataFile(root, data, "v3_train");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("pilot index outside ") + label);
+        }
+    };
+    validateIndices(result.trainIndices, result.train.fullWindows, "v3 train");
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows, "v3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows, "v1 validation");
+    return result;
+}
+
 class NativeTrainer {
 public:
     NativeTrainer(const Bundle& bundle, std::string workDirectory)
@@ -1229,6 +1394,7 @@ public:
     }
 
     NativeGateResult run(const std::function<double()>& cpuBaseline);
+    NativePilotResult runPilot(const PilotPackageData& pilot);
     const std::string& currentStage() const { return currentStage_; }
 
 private:
@@ -1376,6 +1542,11 @@ private:
     void computeGlobalNorm();
     void adamStep();
     void fullTrainingStep();
+    float readLoss();
+    float readGlobalNorm();
+    void setWindowFromU16(const PilotDataFile& data, int windowIndex);
+    double evaluateCe(
+        const PilotDataFile& data, const std::vector<int>& indices);
 
     std::vector<float> gather(cl_mem source, const std::vector<int>& indices);
     ForwardGate checkForward();
@@ -2166,6 +2337,53 @@ void NativeTrainer::fullTrainingStep() {
     adamStep();
 }
 
+
+float NativeTrainer::readLoss() {
+    float value = 0.0f;
+    runtime_.read(loss_, &value, sizeof(value));
+    req(std::isfinite(value), "nonfinite native pilot loss");
+    return value;
+}
+
+float NativeTrainer::readGlobalNorm() {
+    float value = 0.0f;
+    runtime_.read(globalNorm_, &value, sizeof(value));
+    req(std::isfinite(value) && value >= 0.0f,
+        "nonfinite native pilot global grad norm");
+    return value;
+}
+
+void NativeTrainer::setWindowFromU16(
+    const PilotDataFile& data, int windowIndex) {
+    req(windowIndex >= 0 && windowIndex < data.fullWindows,
+        "pilot window index out of range");
+    const size_t offset = static_cast<size_t>(windowIndex) * S;
+    req(offset + S < data.tokens.size(),
+        "pilot window exceeds token file");
+    std::array<int32_t, S + 1> window{};
+    for (int i = 0; i <= S; ++i) {
+        window[static_cast<size_t>(i)] =
+            static_cast<int32_t>(data.tokens[offset + static_cast<size_t>(i)]);
+    }
+    setTrainingWindow(window.data());
+}
+
+double NativeTrainer::evaluateCe(
+    const PilotDataFile& data, const std::vector<int>& indices) {
+    req(!indices.empty(), "empty pilot eval index set");
+    long double total = 0.0;
+    for (int index : indices) {
+        setWindowFromU16(data, index);
+        forward();
+        total += static_cast<long double>(readLoss());
+    }
+    runtime_.finish();
+    const double mean = static_cast<double>(
+        total / static_cast<long double>(indices.size()));
+    req(std::isfinite(mean), "nonfinite pilot validation CE");
+    return mean;
+}
+
 std::vector<float> NativeTrainer::gather(
     cl_mem source, const std::vector<int>& indices) {
     req(!indices.empty() && indices.size() <= 4096,
@@ -2797,6 +3015,159 @@ std::string probeErrorJson(const ProbeError& error) {
     return out.str();
 }
 
+
+NativePilotResult NativeTrainer::runPilot(const PilotPackageData& pilot) {
+    mark("native:pilot:initialize:start");
+    initializeSlots();
+    initializeInputs();
+    initializeActivations();
+
+    const ProbeError weightError = validateWeightLoad();
+    req(std::isfinite(weightError.maxAbs) && weightError.maxAbs == 0.0,
+        "pilot source weight-load verification failed");
+
+    mark("native:pilot:baseline:start");
+    resetToSourceState();
+    const double baselineV3 =
+        evaluateCe(pilot.v3Validation, pilot.v3EvalIndices);
+    const double baselineV1 =
+        evaluateCe(pilot.v1Validation, pilot.v1EvalIndices);
+    mark("native:pilot:baseline:done");
+
+    struct Candidate {
+        double lr = 0.0;
+        bool pass = false;
+        double seconds = 0.0;
+        double tokensPerSecond = 0.0;
+        double firstLossMean = 0.0;
+        double lastLossMean = 0.0;
+        double finalTrainLoss = 0.0;
+        double maxGradNorm = 0.0;
+        double finalV3 = 0.0;
+        double finalV1 = 0.0;
+    };
+    std::vector<Candidate> results;
+    results.reserve(pilot.lrCandidates.size());
+
+    for (size_t candidateIndex = 0;
+         candidateIndex < pilot.lrCandidates.size(); ++candidateIndex) {
+        const double candidateLr = pilot.lrCandidates[candidateIndex];
+        mark("native:pilot:candidate:" +
+             std::to_string(candidateIndex) + ":reset");
+        resetToSourceState();
+        req(optimizerStep_ == 0, "pilot candidate did not start at step zero");
+
+        std::vector<double> losses;
+        losses.reserve(static_cast<size_t>(pilot.trainSteps));
+        double maxNorm = 0.0;
+
+        mark("native:pilot:candidate:" +
+             std::to_string(candidateIndex) + ":train");
+        const auto started = std::chrono::steady_clock::now();
+        for (int step = 0; step < pilot.trainSteps; ++step) {
+            setWindowFromU16(pilot.train, pilot.trainIndices[step]);
+            const int warmNumerator = std::min(step + 1, pilot.warmupSteps);
+            const float lr = static_cast<float>(
+                candidateLr *
+                static_cast<double>(warmNumerator) /
+                static_cast<double>(pilot.warmupSteps));
+            setLearningRate(lr);
+            fullTrainingStep();
+            losses.push_back(static_cast<double>(readLoss()));
+            maxNorm = std::max(
+                maxNorm, static_cast<double>(readGlobalNorm()));
+        }
+        runtime_.finish();
+        const auto stopped = std::chrono::steady_clock::now();
+
+        req(optimizerStep_ == static_cast<uint64_t>(pilot.trainSteps),
+            "pilot candidate optimizer-step count mismatch");
+        req(!losses.empty(), "pilot candidate produced no loss samples");
+
+        const int edge = std::min<int>(12, losses.size());
+        long double first = 0.0, last = 0.0;
+        for (int i = 0; i < edge; ++i) {
+            first += losses[static_cast<size_t>(i)];
+            last += losses[losses.size() - edge + static_cast<size_t>(i)];
+        }
+
+        Candidate result;
+        result.lr = candidateLr;
+        result.seconds = std::chrono::duration<double>(
+            stopped - started).count();
+        result.tokensPerSecond =
+            static_cast<double>(pilot.trainSteps) * S /
+            std::max(result.seconds, 1.0e-9);
+        result.firstLossMean =
+            static_cast<double>(first / static_cast<long double>(edge));
+        result.lastLossMean =
+            static_cast<double>(last / static_cast<long double>(edge));
+        result.finalTrainLoss = losses.back();
+        result.maxGradNorm = maxNorm;
+
+        mark("native:pilot:candidate:" +
+             std::to_string(candidateIndex) + ":evaluate");
+        result.finalV3 =
+            evaluateCe(pilot.v3Validation, pilot.v3EvalIndices);
+        result.finalV1 =
+            evaluateCe(pilot.v1Validation, pilot.v1EvalIndices);
+        result.pass =
+            std::isfinite(result.firstLossMean) &&
+            std::isfinite(result.lastLossMean) &&
+            std::isfinite(result.finalTrainLoss) &&
+            std::isfinite(result.maxGradNorm) &&
+            std::isfinite(result.finalV3) &&
+            std::isfinite(result.finalV1) &&
+            result.tokensPerSecond > 0.0;
+        results.push_back(result);
+    }
+
+    bool allPass = !results.empty();
+    for (const auto& value : results) allPass = allPass && value.pass;
+
+    std::ostringstream out;
+    out << "{\"status\":\"" << (allPass ? "PASS" : "FAIL")
+        << "\",\"schema\":\"model0001_v3_lr_pilot_report_v1\""
+        << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+        << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
+        << ",\"source_model_state_sha256\":"
+        << "\"047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d\""
+        << ",\"fresh_zero_moments_each_candidate\":true"
+        << ",\"train_steps_per_candidate\":" << pilot.trainSteps
+        << ",\"warmup_steps\":" << pilot.warmupSteps
+        << ",\"target_tokens_per_update\":" << S
+        << ",\"baseline\":{\"v3_validation_ce\":"
+        << std::setprecision(17) << baselineV3
+        << ",\"v1_validation_ce\":" << baselineV1 << "}"
+        << ",\"candidates\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) out << ",";
+        const auto& value = results[i];
+        out << "{\"lr\":" << std::setprecision(17) << value.lr
+            << ",\"pass\":" << (value.pass ? "true" : "false")
+            << ",\"seconds\":" << value.seconds
+            << ",\"pilot_tokens_per_second\":" << value.tokensPerSecond
+            << ",\"first_12_train_loss_mean\":" << value.firstLossMean
+            << ",\"last_12_train_loss_mean\":" << value.lastLossMean
+            << ",\"final_train_loss\":" << value.finalTrainLoss
+            << ",\"max_global_grad_norm\":" << value.maxGradNorm
+            << ",\"v3_validation_ce\":" << value.finalV3
+            << ",\"v3_validation_delta\":"
+            << (value.finalV3 - baselineV3)
+            << ",\"v1_validation_ce\":" << value.finalV1
+            << ",\"v1_validation_delta\":"
+            << (value.finalV1 - baselineV1)
+            << "}";
+    }
+    out << "]"
+        << ",\"production_lr_locked\":false"
+        << ",\"test_split_used\":false"
+        << ",\"pass\":" << (allPass ? "true" : "false") << "}";
+
+    mark(allPass ? "native:pilot:pass" : "native:pilot:fail");
+    return NativePilotResult{allPass, out.str()};
+}
+
 NativeGateResult NativeTrainer::run(
     const std::function<double()>& cpuBaseline) {
     initializeSlots();
@@ -3096,6 +3467,36 @@ NativeGateResult runNativeModel0001Gate(
             << "\""
             << ",\"error\":\"" << jsonEscape(error.what())
             << "\",\"pass\":false}";
+        cached = {false, out.str()};
+    }
+    completed = true;
+    return cached;
+}
+
+
+NativePilotResult runNativeModel0001LrPilot(
+    const Bundle& bundle,
+    const std::string& pilotRoot,
+    const std::string& workDir) {
+    static bool completed = false;
+    static NativePilotResult cached;
+    if (completed) return cached;
+    NativeTrainer* trainer = nullptr;
+    try {
+        const PilotPackageData pilot = loadPilotPackage(pilotRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        cached = trainer->runPilot(pilot);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_v3_lr_pilot_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(trainer ? trainer->currentStage() : "native:pilot:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":false"
+            << ",\"test_split_used\":false,\"pass\":false}";
         cached = {false, out.str()};
     }
     completed = true;

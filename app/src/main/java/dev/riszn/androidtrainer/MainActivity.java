@@ -40,6 +40,7 @@ public final class MainActivity extends Activity {
     private static final int REQ_BUNDLE = 1001;
     private static final int REQ_REPORT = 1002;
     private static final int REQ_CRASH_TRACE = 1003;
+    private static final int REQ_PILOT = 1004;
 
     static {
         System.loadLibrary("android_trainer");
@@ -47,7 +48,9 @@ public final class MainActivity extends Activity {
 
     private TextView log;
     private Button run;
+    private Button pilotRun;
     private File bundleDir;
+    private File pilotDir;
     private String lastReport = "";
     private File lastNativeTrace;
     private PowerManager powerManager;
@@ -56,6 +59,7 @@ public final class MainActivity extends Activity {
     private static native String nativeOpenClConformance();
     private static native String nativeValidateBundle(String bundleDir);
     private static native String nativeRunGate(String bundleDir, String workDir, float thermalHeadroom);
+    private static native String nativeRunLrPilot(String bundleDir, String pilotDir, String workDir);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -101,6 +105,15 @@ public final class MainActivity extends Activity {
         run.setEnabled(false);
         run.setOnClickListener(v -> runGate());
         buttons.addView(run);
+
+        Button selectPilot = button("5. Import Foundation-v3 LR pilot package");
+        selectPilot.setOnClickListener(v -> selectPilot());
+        buttons.addView(selectPilot);
+
+        pilotRun = button("6. Run Foundation-v3 LR pilot");
+        pilotRun.setEnabled(false);
+        pilotRun.setOnClickListener(v -> runLrPilot());
+        buttons.addView(pilotRun);
 
         Button export = button("Export last JSON report");
         export.setOnClickListener(v -> exportReport());
@@ -289,6 +302,7 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         if (requestCode == REQ_BUNDLE) importBundle(data.getData());
+        if (requestCode == REQ_PILOT) importPilot(data.getData());
         if (requestCode == REQ_REPORT) writeReport(data.getData());
         if (requestCode == REQ_CRASH_TRACE) writeNativeTrace(data.getData());
     }
@@ -325,12 +339,92 @@ public final class MainActivity extends Activity {
                 bundleDir = dest;
                 runOnUiThread(() -> {
                     run.setEnabled(true);
+                    updatePilotEnabled();
                     if (runAfterImport) runGate();
                 });
             } catch (Throwable t) {
                 append("IMPORT FAIL: " + t);
             }
         }, "android-trainer-import").start();
+    }
+
+
+    private void selectPilot() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_MIME_TYPES,
+                new String[]{"application/zip", "application/octet-stream"});
+        startActivityForResult(i, REQ_PILOT);
+    }
+
+    private void importPilot(Uri uri) {
+        append("\n=== IMPORT FOUNDATION-v3 LR PILOT ===");
+        pilotRun.setEnabled(false);
+        new Thread(() -> {
+            try {
+                File zip = new File(getFilesDir(), "model0001-v3-lr-pilot.atpilot");
+                try (InputStream in = getContentResolver().openInputStream(uri);
+                     OutputStream out = new BufferedOutputStream(new FileOutputStream(zip))) {
+                    if (in == null)
+                        throw new IllegalStateException("content resolver returned null pilot stream");
+                    copy(in, out);
+                }
+                String pilotSha = sha256(zip);
+                File dest = new File(getFilesDir(), "pilot_bundle");
+                deleteTree(dest);
+                if (!dest.mkdirs() && !dest.isDirectory())
+                    throw new IllegalStateException("cannot create pilot dir");
+                unzipSafely(zip, dest);
+                verifyPilotFiles(dest);
+                pilotDir = dest;
+                append("pilot_package_sha256: " + pilotSha);
+                append("pilot package verification: PASS");
+                runOnUiThread(this::updatePilotEnabled);
+            } catch (Throwable t) {
+                append("PILOT IMPORT FAIL: " + t);
+            }
+        }, "android-trainer-pilot-import").start();
+    }
+
+    private void verifyPilotFiles(File root) throws Exception {
+        File manifestFile = new File(root, "manifest.json");
+        if (!manifestFile.isFile())
+            throw new IllegalStateException("pilot manifest.json missing");
+        String text = new String(
+                java.nio.file.Files.readAllBytes(manifestFile.toPath()),
+                java.nio.charset.StandardCharsets.UTF_8);
+        JSONObject manifest = new JSONObject(text);
+        if (!"model0001_v3_lr_pilot_v1".equals(manifest.getString("schema")))
+            throw new IllegalStateException("wrong pilot schema");
+        if (!"047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d"
+                .equals(manifest.getString("source_model_state_sha256")))
+            throw new IllegalStateException("pilot source-model SHA mismatch");
+        JSONObject guards = manifest.getJSONObject("hard_guards");
+        if (guards.getBoolean("test_split_packaged"))
+            throw new IllegalStateException("pilot package contains test split");
+        if (guards.getBoolean("dataset_v2_train_bin_packaged"))
+            throw new IllegalStateException("pilot package contains Dataset-v2 train");
+
+        JSONObject data = manifest.getJSONObject("data");
+        String[] keys = new String[]{"v3_train", "v3_validation", "v1_validation"};
+        for (String key : keys) {
+            JSONObject spec = data.getJSONObject(key);
+            File file = canonicalChild(root, spec.getString("path"));
+            if (!file.isFile())
+                throw new IllegalStateException("pilot data missing: " + key);
+            long expectedBytes = spec.getLong("uint16_tokens") * 2L;
+            if (file.length() != expectedBytes)
+                throw new IllegalStateException("pilot data size mismatch: " + key);
+            String got = sha256(file);
+            if (!got.equalsIgnoreCase(spec.getString("sha256")))
+                throw new IllegalStateException("pilot data SHA mismatch: " + key);
+        }
+    }
+
+    private void updatePilotEnabled() {
+        if (pilotRun != null)
+            pilotRun.setEnabled(bundleDir != null && pilotDir != null);
     }
 
     private void verifyBundleFiles(File root) throws Exception {
@@ -409,6 +503,74 @@ public final class MainActivity extends Activity {
         }, "android-trainer-gate").start();
     }
 
+
+    private void runLrPilot() {
+        if (bundleDir == null || pilotDir == null) return;
+        append("\n=== FOUNDATION-v3 LR PILOT ===");
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                ActivityManager am =
+                        (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                if (am != null)
+                    am.setProcessStateSummary(
+                            "model0001-v3-lr-pilot-running".getBytes(
+                                    java.nio.charset.StandardCharsets.UTF_8));
+            } catch (Throwable ignored) {}
+        }
+        run.setEnabled(false);
+        pilotRun.setEnabled(false);
+        new Thread(() -> {
+            PowerManager.WakeLock wl = null;
+            try {
+                wl = powerManager.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "AndroidTrainer:V3LrPilot");
+                wl.acquire(40L * 60L * 1000L);
+                float thermalStart = thermalHeadroom();
+                long startNs = android.os.SystemClock.elapsedRealtimeNanos();
+                String out = nativeRunLrPilot(
+                        bundleDir.getAbsolutePath(),
+                        pilotDir.getAbsolutePath(),
+                        getFilesDir().getAbsolutePath());
+                float thermalEnd = thermalHeadroom();
+                double seconds =
+                        (android.os.SystemClock.elapsedRealtimeNanos() - startNs)
+                                / 1.0e9;
+                try {
+                    JSONObject reportObj = new JSONObject(out);
+                    reportObj.put(
+                            "thermal_headroom_start",
+                            Float.isNaN(thermalStart)
+                                    ? JSONObject.NULL : thermalStart);
+                    reportObj.put(
+                            "thermal_headroom_end",
+                            Float.isNaN(thermalEnd)
+                                    ? JSONObject.NULL : thermalEnd);
+                    reportObj.put("pilot_wall_seconds", seconds);
+                    out = reportObj.toString();
+                } catch (Exception ignored) {}
+                lastReport = out;
+                File report = new File(
+                        getFilesDir(), "last_v3_lr_pilot_report.json");
+                try (FileOutputStream os = new FileOutputStream(report)) {
+                    os.write(out.getBytes(
+                            java.nio.charset.StandardCharsets.UTF_8));
+                    os.getFD().sync();
+                }
+                publishReport(out);
+                append(pretty(out));
+            } catch (Throwable t) {
+                append("LR PILOT FAIL: " + t);
+            } finally {
+                if (wl != null && wl.isHeld()) wl.release();
+                runOnUiThread(() -> {
+                    run.setEnabled(bundleDir != null);
+                    updatePilotEnabled();
+                });
+            }
+        }, "android-trainer-v3-lr-pilot").start();
+    }
+
     private float thermalHeadroom() {
         if (Build.VERSION.SDK_INT >= 29) {
             try { return powerManager.getThermalHeadroom(0); }
@@ -420,8 +582,16 @@ public final class MainActivity extends Activity {
     private void publishReport(String report) {
         if (Build.VERSION.SDK_INT < 29) return;
         ContentValues values = new ContentValues();
+        String reportPrefix = "model0001-native-opencl-gate-";
+        try {
+            JSONObject reportObj = new JSONObject(report);
+            if ("model0001_v3_lr_pilot_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                reportPrefix = "model0001-v3-lr-pilot-";
+            }
+        } catch (Exception ignored) {}
         values.put(MediaStore.MediaColumns.DISPLAY_NAME,
-                "model0001-native-opencl-gate-" + System.currentTimeMillis() + ".json");
+                reportPrefix + System.currentTimeMillis() + ".json");
         values.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
         values.put(MediaStore.MediaColumns.RELATIVE_PATH,
                 Environment.DIRECTORY_DOWNLOADS + "/Android-Trainer");
@@ -450,7 +620,15 @@ public final class MainActivity extends Activity {
         Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("application/json");
-        i.putExtra(Intent.EXTRA_TITLE, "model0001-gpu-gate-report.json");
+        String title = "model0001-gpu-gate-report.json";
+        try {
+            JSONObject reportObj = new JSONObject(lastReport);
+            if ("model0001_v3_lr_pilot_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                title = "model0001-v3-lr-pilot-report.json";
+            }
+        } catch (Exception ignored) {}
+        i.putExtra(Intent.EXTRA_TITLE, title);
         startActivityForResult(i, REQ_REPORT);
     }
 

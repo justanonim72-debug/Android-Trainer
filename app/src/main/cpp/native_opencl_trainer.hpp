@@ -19,6 +19,20 @@ NativeGateResult runNativeModel0001Gate(
     const std::string& workDir,
     const std::function<double()>& cpuBaselineTokensPerSecond);
 
+
+struct NativePilotResult {
+    bool pass = false;
+    std::string json;
+};
+
+// Runs the locked Foundation-v3 LR pilot from the immutable CPT-v2 bundle.
+// The pilot package contains data + protocol only; each LR candidate resets
+// source weights and Adam moments before any update.
+NativePilotResult runNativeModel0001LrPilot(
+    const Bundle& bundle,
+    const std::string& pilotRoot,
+    const std::string& workDir);
+
 std::string probeNativeOpenClJson();
 
 }  // namespace at
