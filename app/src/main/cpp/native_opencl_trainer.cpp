@@ -1003,6 +1003,7 @@ private:
     SlotBuffers* embedding_ = nullptr;
     SlotBuffers* finalNorm_ = nullptr;
     uint64_t optimizerStep_ = 0;
+    float currentLearningRate_ = 0.0f;
     size_t persistentBytes_ = 0;
     size_t activationBytes_ = 0;
     size_t workspaceBytes_ = 0;
@@ -1082,6 +1083,8 @@ private:
 
     void initializeSlots();
     void initializeInputs();
+    void setTrainingWindow(const int32_t* tokens257);
+    void setLearningRate(float lr);
     void initializeActivations();
     void wireLayers();
     void validateGeometry() const;
@@ -1215,9 +1218,6 @@ void NativeTrainer::wireLayers() {
 void NativeTrainer::initializeInputs() {
     tokens_ = runtime_.allocate(S * sizeof(int32_t));
     targets_ = runtime_.allocate(S * sizeof(int32_t));
-    runtime_.write(tokens_, bundle_.sampleTokens.data(), S * sizeof(int32_t));
-    runtime_.write(
-        targets_, bundle_.sampleTokens.data() + 1, S * sizeof(int32_t));
 
     std::vector<float> cosines(S * HD), sines(S * HD);
     for (int position = 0; position < S; ++position) {
@@ -1239,29 +1239,53 @@ void NativeTrainer::initializeInputs() {
     runtime_.write(ropeCos_, cosines.data(), bytesFor(cosines.size()));
     runtime_.write(ropeSin_, sines.data(), bytesFor(sines.size()));
 
+    // Production windows can have a different number of unique tokens than
+    // the parity sample. Allocate worst-case tables once and only rewrite their
+    // contents per step.
+    uniqueTokenIds_ = runtime_.allocate(S * sizeof(int32_t));
+    uniquePositions_ = runtime_.allocate(S * sizeof(int32_t));
+    uniqueOffsets_ = runtime_.allocate((S + 1) * sizeof(int32_t));
+    setTrainingWindow(bundle_.sampleTokens.data());
+    setLearningRate(static_cast<float>(bundle_.adam.gateLr));
+}
+
+void NativeTrainer::setTrainingWindow(const int32_t* tokens257) {
+    req(tokens257 != nullptr, "null training window");
+    for (int i = 0; i <= S; ++i) {
+        req(tokens257[i] >= 0 && tokens257[i] < V,
+            "training window token out of vocabulary");
+    }
+    runtime_.write(tokens_, tokens257, S * sizeof(int32_t));
+    runtime_.write(targets_, tokens257 + 1, S * sizeof(int32_t));
+
     std::map<int32_t, std::vector<int32_t>> byToken;
     for (int position = 0; position < S; ++position) {
-        byToken[bundle_.sampleTokens[position]].push_back(position);
+        byToken[tokens257[position]].push_back(position);
     }
     std::vector<int32_t> ids;
     std::vector<int32_t> positions;
     std::vector<int32_t> offsets;
+    offsets.reserve(byToken.size() + 1);
     offsets.push_back(0);
     for (const auto& item : byToken) {
         ids.push_back(item.first);
         positions.insert(positions.end(), item.second.begin(), item.second.end());
         offsets.push_back(static_cast<int32_t>(positions.size()));
     }
-    uniqueTokenCount_ = static_cast<int>(ids.size());
-    req(!ids.empty() && positions.size() == S,
+    req(!ids.empty() && ids.size() <= S && positions.size() == S &&
+        offsets.size() == ids.size() + 1,
         "embedding reduction position table invalid");
-    uniqueTokenIds_ = runtime_.allocate(ids.size() * sizeof(int32_t));
-    uniquePositions_ = runtime_.allocate(positions.size() * sizeof(int32_t));
-    uniqueOffsets_ = runtime_.allocate(offsets.size() * sizeof(int32_t));
+    uniqueTokenCount_ = static_cast<int>(ids.size());
     runtime_.write(uniqueTokenIds_, ids.data(), ids.size() * sizeof(int32_t));
     runtime_.write(
         uniquePositions_, positions.data(), positions.size() * sizeof(int32_t));
-    runtime_.write(uniqueOffsets_, offsets.data(), offsets.size() * sizeof(int32_t));
+    runtime_.write(
+        uniqueOffsets_, offsets.data(), offsets.size() * sizeof(int32_t));
+}
+
+void NativeTrainer::setLearningRate(float lr) {
+    req(std::isfinite(lr) && lr > 0.0f, "production learning rate invalid");
+    currentLearningRate_ = lr;
 }
 
 void NativeTrainer::initializeActivations() {
@@ -1796,7 +1820,9 @@ void NativeTrainer::adamStep() {
     ++optimizerStep_;
     req(optimizerStep_ <= static_cast<uint64_t>(std::numeric_limits<int>::max()),
         "optimizer step overflow");
-    const float lr = static_cast<float>(bundle_.adam.gateLr);
+    req(std::isfinite(currentLearningRate_) && currentLearningRate_ > 0.0f,
+        "learning rate was not initialized");
+    const float lr = currentLearningRate_;
     const float beta1 = static_cast<float>(bundle_.adam.beta1);
     const float beta2 = static_cast<float>(bundle_.adam.beta2);
     const float eps = static_cast<float>(bundle_.adam.eps);

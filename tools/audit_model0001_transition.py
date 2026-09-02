@@ -10,9 +10,11 @@ inventing them.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +74,87 @@ def find_completion_marker(ckpt: Path):
                 except Exception:
                     pass
     return None, None
+
+
+
+def extract_engine_recipe_evidence(engine, engine_path: Path):
+    """Collect literal training-policy evidence from the real script-17 engine.
+
+    This intentionally returns candidates rather than deciding a new stage.
+    Values are accepted only when they are literal module globals or literal
+    argparse defaults in the source file.
+    """
+    out = {}
+    wanted = re.compile(
+        r"(?:^|_)(?:lr|learning_rate|max_lr|min_lr|warmup|epoch|steps?|"
+        r"checkpoint|save_every|eval_every|log_every|seed|shuffle|schedule|"
+        r"scheduler)(?:_|$)",
+        re.I,
+    )
+    for name in dir(engine):
+        if not wanted.search(name):
+            continue
+        try:
+            value = getattr(engine, name)
+        except Exception:
+            continue
+        if value is None or isinstance(value, (bool, int, float, str)):
+            out[f"engine_global.{name}"] = jsonable(value)
+
+    try:
+        tree = ast.parse(engine_path.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        is_add_argument = (
+            isinstance(fn, ast.Attribute) and fn.attr == "add_argument"
+        )
+        if not is_add_argument or not node.args:
+            continue
+        flags = []
+        for arg in node.args:
+            try:
+                value = ast.literal_eval(arg)
+            except Exception:
+                continue
+            if isinstance(value, str):
+                flags.append(value)
+        if not flags:
+            continue
+        dest = None
+        for flag in flags:
+            if flag.startswith("--"):
+                dest = flag[2:].replace("-", "_")
+                break
+        if not dest or not wanted.search(dest):
+            continue
+        default_node = None
+        for kw in node.keywords:
+            if kw.arg == "default":
+                default_node = kw.value
+                break
+        if default_node is None:
+            continue
+        try:
+            default = ast.literal_eval(default_node)
+        except Exception:
+            # Common pattern: default=DEFAULT_LR. Resolve only literal globals
+            # already observed from the imported real engine module.
+            if isinstance(default_node, ast.Name):
+                key = f"engine_global.{default_node.id}"
+                if key in out:
+                    default = out[key]
+                else:
+                    continue
+            else:
+                continue
+        if default is None or isinstance(default, (bool, int, float, str)):
+            out[f"argparse_default.{dest}"] = jsonable(default)
+    return out
 
 
 def extract_scheduler_evidence(ck: dict, contract: dict):
@@ -161,6 +244,10 @@ def main():
     stage_tokens = first(ck, ["stage_tokens_seen", "stage_tokens", "stage_scored_train_tokens"])
     lifetime_tokens = first(ck, ["lifetime_tokens_seen", "lifetime_tokens", "cumulative_tokens_seen"])
 
+    engine_recipe_evidence = extract_engine_recipe_evidence(engine, engine_path)
+    scheduler_evidence = extract_scheduler_evidence(ck, contract)
+    scheduler_evidence.update(engine_recipe_evidence)
+
     known = {
         "source_weights": {
             "checkpoint": str(ckpt),
@@ -201,7 +288,8 @@ def main():
             "sha256": sha256_file(marker_path) if marker_path else None,
             "status": marker.get("status"),
         },
-        "scheduler_and_cadence_evidence": extract_scheduler_evidence(ck, contract),
+        "scheduler_and_cadence_evidence": scheduler_evidence,
+        "engine_recipe_evidence": engine_recipe_evidence,
     }
 
     # These fields are mandatory before production training is allowed to mutate
@@ -209,22 +297,23 @@ def main():
     # 1e-4 gate LR or from the 20-step benchmark.
     ev = known["scheduler_and_cadence_evidence"]
     requirements = {
-        "next_stage_name": bool(first(contract, ["stage_name", "run_name", "name"])),
+        "next_stage_name": bool(first(contract, ["stage_name", "run_name", "name"])) or
+            any(k.endswith((".run_name", ".stage_name")) for k in ev),
         "next_stage_total_updates_or_epochs": any(
-            k.endswith((".total_steps", ".max_steps", ".steps", ".epochs"))
+            k.endswith((".total_steps", ".max_steps", ".steps", ".epochs", ".epoch"))
             for k in ev
         ),
         "production_lr_or_schedule": any(
-            any(token in k for token in (".lr", "learning_rate", "max_lr", "peak_lr", "schedule"))
+            any(token in k.lower() for token in (".lr", "learning_rate", "max_lr", "peak_lr", "schedule", "scheduler"))
             for k in ev
         ),
         "sample_order_seed_or_explicit_cursor_policy": any(
-            ("seed" in k or "shuffle" in k) for k in ev
+            ("seed" in k.lower() or "shuffle" in k.lower()) for k in ev
         ) or ck.get("cursor") is not None,
         "checkpoint_cadence": any(
-            ("checkpoint_every" in k or "save_every" in k) for k in ev
+            ("checkpoint_every" in k.lower() or "save_every" in k.lower()) for k in ev
         ),
-        "evaluation_cadence": any("eval_every" in k for k in ev),
+        "evaluation_cadence": any("eval_every" in k.lower() for k in ev),
     }
     missing = [name for name, present in requirements.items() if not present]
 

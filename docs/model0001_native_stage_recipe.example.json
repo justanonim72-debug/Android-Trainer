@@ -1,0 +1,31 @@
+{
+  "schema": "model0001_native_stage_recipe_v1",
+  "note": "TEMPLATE ONLY. Replace every REPLACE_* value from the Training-project decision record; do not train from this file.",
+  "source_model_state_sha256": "047b0f6ec18046c7a5ae7da707e91a03e26a6819cfec254f8ad541c8ddbf696d",
+  "train_bin_sha256": "REPLACE_FROM_TRANSITION_AUDIT",
+  "stage_name": "REPLACE_FROM_TRAINING_SESSION",
+  "total_updates": 0,
+  "target_tokens_per_update": 256,
+  "start_lifetime_tokens": 5535744,
+  "optimizer_init": "fresh_zero_moments",
+  "optimizer": {
+    "name": "AdamW",
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "eps": 1e-8,
+    "grad_clip": 1
+  },
+  "lr_schedule": {
+    "type": "REPLACE_constant_OR_linear_warmup_cosine"
+  },
+  "sample_order": {
+    "type": "REPLACE_FROM_TRAINING_SESSION",
+    "seed": "REPLACE_IF_APPLICABLE"
+  },
+  "checkpoint_every": 0,
+  "eval_every": 0,
+  "log_every": 0,
+  "test_split_used": false
+}
