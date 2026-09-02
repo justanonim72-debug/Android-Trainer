@@ -990,11 +990,13 @@ public:
     }
 
     NativeGateResult run(const std::function<double()>& cpuBaseline);
+    const std::string& currentStage() const { return currentStage_; }
 
 private:
     const Bundle& bundle_;
     std::string workDirectory_;
     std::string stagePath_;
+    std::string currentStage_ = "native:initialize";
     ProcessRuntime& runtime_;
     std::map<std::string, SlotBuffers> slots_;
     std::array<LayerBuffers, LAYERS> layers_{};
@@ -1056,7 +1058,8 @@ private:
     cl_mem probeIndices_ = nullptr;
     cl_mem probeOutput_ = nullptr;
 
-    void mark(const std::string& value) const {
+    void mark(const std::string& value) {
+        currentStage_ = value;
         try {
             atomicWrite(stagePath_, value.data(), value.size());
         } catch (...) {
@@ -1188,6 +1191,24 @@ void NativeTrainer::wireLayers() {
         item.gate = &slot(prefix + "gate_proj.weight");
         item.up = &slot(prefix + "up_proj.weight");
         item.down = &slot(prefix + "down_proj.weight");
+    }
+    auto expectShape = [](const SlotBuffers& value,
+                          std::initializer_list<int> expected) {
+        req(value.shape == std::vector<int>(expected),
+            "native tensor shape mismatch: " + value.name);
+    };
+    expectShape(*embedding_, {V, D});
+    expectShape(*finalNorm_, {D});
+    for (const auto& item : layers_) {
+        expectShape(*item.attnNorm, {D});
+        expectShape(*item.q, {D, D});
+        expectShape(*item.k, {HKV * HD, D});
+        expectShape(*item.v, {HKV * HD, D});
+        expectShape(*item.o, {D, D});
+        expectShape(*item.ffnNorm, {D});
+        expectShape(*item.gate, {FF, D});
+        expectShape(*item.up, {FF, D});
+        expectShape(*item.down, {D, FF});
     }
 }
 
@@ -2556,10 +2577,11 @@ NativeGateResult runNativeModel0001Gate(
     static bool completed = false;
     static NativeGateResult cached;
     if (completed) return cached;
+    NativeTrainer* trainer = nullptr;
     try {
         // The object and every OpenCL allocation are intentionally retained to
         // process death. This avoids entering the proven-bad Mali teardown path.
-        NativeTrainer* trainer = new NativeTrainer(bundle, workDirectory);
+        trainer = new NativeTrainer(bundle, workDirectory);
         cached = trainer->run(cpuBaselineTokensPerSecond);
     } catch (const std::exception& error) {
         std::ostringstream out;
@@ -2567,7 +2589,9 @@ NativeGateResult runNativeModel0001Gate(
             << ",\"schema\":\"model0001_native_opencl_gate_report_v1\""
             << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
             << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
-            << "\",\"first_failing_stage\":\"NATIVE_EXCEPTION\""
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(trainer ? trainer->currentStage() : "native:initialize")
+            << "\""
             << ",\"error\":\"" << jsonEscape(error.what())
             << "\",\"pass\":false}";
         cached = {false, out.str()};
