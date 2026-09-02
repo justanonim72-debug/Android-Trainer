@@ -36,6 +36,35 @@ def rel(project: Path, path: Path) -> str:
     try: return str(path.relative_to(project))
     except Exception: return str(path)
 
+def classify_candidate(project: Path, p: Path) -> tuple[str, bool, str]:
+    r = rel(project, p).replace("\\", "/")
+    low = r.lower()
+
+    # Never candidate training data.
+    if "/test." in "/" + low or low.startswith("data/splits/test"):
+        return "test_split", False, "test data is forbidden"
+    if low.startswith(("reports/", "benchmarks/")):
+        return "report_or_benchmark", False, "metadata/eval artifact"
+    if low.startswith(("data/tokenizer/", "data/tokenizer_corpus/",
+                       "artifacts/tokenizer_v1/")):
+        return "tokenizer_artifact", False, "tokenizer/training metadata"
+    if low.startswith(("artifacts/", "config/", "scripts/", "provenance/")):
+        return "project_artifact", False, "project metadata/code, not corpus"
+    if low.startswith(".") or low.endswith((".md",)):
+        return "project_note", False, "notes/patch documentation"
+    if low.startswith("data/raw_v2/"):
+        return "prior_v2_source", False, "old v2 source; retention-only if explicitly selected"
+    if low.startswith("data/corpus_v2/"):
+        return "prior_v2_corpus", False, "old v2 corpus; never new-v3"
+    if low.startswith("data/raw/") or low.startswith("data/splits/"):
+        return "prior_v1_source", False, "old v1 source; retention-only if explicitly selected"
+
+    # A file outside all known historical/project buckets is only a NEW SOURCE
+    # CANDIDATE. It is not approved until provenance/license/content-family
+    # metadata and prior-corpus dedupe are supplied.
+    return "unclassified_new_candidate", True, "needs provenance/license/content audit"
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--project", default="/storage/emulated/0/Download/friend_core_corpus_bootstrap_v1")
@@ -91,11 +120,15 @@ def main():
             size=p.stat().st_size
             if size == 0:
                 continue
+            source_class, new_candidate, reason = classify_candidate(project, p)
             candidates.append({
                 "path":rel(project,p),
                 "bytes":size,
                 "lines":line_count(p),
                 "sha256":sha256(p),
+                "source_class":source_class,
+                "new_v3_candidate":new_candidate,
+                "classification_reason":reason,
             })
 
     report={
@@ -107,6 +140,12 @@ def main():
       "builder_scripts":scripts,
       "candidate_source_files":candidates,
       "candidate_source_file_count":len(candidates),
+      "eligible_new_source_candidates":[x for x in candidates if x["new_v3_candidate"]],
+      "eligible_new_source_candidate_count":sum(1 for x in candidates if x["new_v3_candidate"]),
+      "classification_counts":dict(__import__("collections").Counter(
+          x["source_class"] for x in candidates
+      )),
+      "inventory_interpretation":"inventory entries are not approved training sources; only eligible_new_source_candidates may proceed to provenance/license/content audit",
       "hard_guards":{
         "read_only":True,
         "packed_dataset_v2_not_candidate_source":True,
