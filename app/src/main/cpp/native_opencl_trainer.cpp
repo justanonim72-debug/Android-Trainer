@@ -193,6 +193,7 @@ __kernel void linear_forward(
 }
 
 // DX[M,K] = DY[M,N] * W[N,K].
+__attribute__((reqd_work_group_size(8, 8, 1)))
 __kernel void linear_dinput(
     __global const float* dy,
     __global const float* w,
@@ -202,24 +203,66 @@ __kernel void linear_dinput(
     int n) {
     __local float yy[TILE][TILE];
     __local float ww[TILE][TILE];
-    int lx = (int)get_local_id(0), ly = (int)get_local_id(1);
-    int kk = (int)get_global_id(0), mm = (int)get_global_id(1);
-    float acc = 0.0f;
+
+    const int lx = (int)get_local_id(0);
+    const int ly = (int)get_local_id(1);
+    const int tx = lx * 2;
+    const int ty = ly * 2;
+    const int k0 = (int)get_group_id(0) * TILE + tx;
+    const int k1 = k0 + 1;
+    const int m0 = (int)get_group_id(1) * TILE + ty;
+    const int m1 = m0 + 1;
+
+    float acc00 = 0.0f, acc01 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f;
+
     for (int t = 0; t < n; t += TILE) {
-        int yn = t + lx;
-        int wn = t + ly;
-        yy[ly][lx] = (mm < m && yn < n) ? dy[mm * n + yn] : 0.0f;
-        int tileK = (int)get_group_id(0) * TILE + lx;
-        ww[ly][lx] = (wn < n && tileK < k) ? w[wn * k + tileK] : 0.0f;
+        const int n0 = t + tx;
+        const int n1 = n0 + 1;
+        const int nr0 = t + ty;
+        const int nr1 = nr0 + 1;
+
+        yy[ty][tx] =
+            (m0 < m && n0 < n) ? dy[m0 * n + n0] : 0.0f;
+        yy[ty][tx + 1] =
+            (m0 < m && n1 < n) ? dy[m0 * n + n1] : 0.0f;
+        yy[ty + 1][tx] =
+            (m1 < m && n0 < n) ? dy[m1 * n + n0] : 0.0f;
+        yy[ty + 1][tx + 1] =
+            (m1 < m && n1 < n) ? dy[m1 * n + n1] : 0.0f;
+
+        ww[ty][tx] =
+            (nr0 < n && k0 < k) ? w[nr0 * k + k0] : 0.0f;
+        ww[ty][tx + 1] =
+            (nr0 < n && k1 < k) ? w[nr0 * k + k1] : 0.0f;
+        ww[ty + 1][tx] =
+            (nr1 < n && k0 < k) ? w[nr1 * k + k0] : 0.0f;
+        ww[ty + 1][tx + 1] =
+            (nr1 < n && k1 < k) ? w[nr1 * k + k1] : 0.0f;
+
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (int q = 0; q < TILE; ++q) acc += yy[ly][q] * ww[q][lx];
+        for (int q = 0; q < TILE; ++q) {
+            const float y0 = yy[ty][q];
+            const float y1 = yy[ty + 1][q];
+            const float w0 = ww[q][tx];
+            const float w1 = ww[q][tx + 1];
+            acc00 += y0 * w0;
+            acc01 += y0 * w1;
+            acc10 += y1 * w0;
+            acc11 += y1 * w1;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (mm < m && kk < k) dx[mm * k + kk] = acc;
+
+    if (m0 < m && k0 < k) dx[m0 * k + k0] = acc00;
+    if (m0 < m && k1 < k) dx[m0 * k + k1] = acc01;
+    if (m1 < m && k0 < k) dx[m1 * k + k0] = acc10;
+    if (m1 < m && k1 < k) dx[m1 * k + k1] = acc11;
 }
 
 // DW[N,K] = DY[M,N]^T * A[M,K]. One work-item owns every output element,
 // so the accumulation is deterministic and race-free.
+__attribute__((reqd_work_group_size(8, 8, 1)))
 __kernel void linear_dweight(
     __global const float* dy,
     __global const float* a,
@@ -229,21 +272,61 @@ __kernel void linear_dweight(
     int n) {
     __local float yy[TILE][TILE];
     __local float aa[TILE][TILE];
-    int lx = (int)get_local_id(0), ly = (int)get_local_id(1);
-    int kk = (int)get_global_id(0), nn = (int)get_global_id(1);
-    float acc = 0.0f;
+
+    const int lx = (int)get_local_id(0);
+    const int ly = (int)get_local_id(1);
+    const int tx = lx * 2;
+    const int ty = ly * 2;
+    const int k0 = (int)get_group_id(0) * TILE + tx;
+    const int k1 = k0 + 1;
+    const int n0 = (int)get_group_id(1) * TILE + ty;
+    const int n1 = n0 + 1;
+
+    float acc00 = 0.0f, acc01 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f;
+
     for (int t = 0; t < m; t += TILE) {
-        int ym = t + lx;
-        int am = t + ly;
-        int tileN = (int)get_group_id(1) * TILE + ly;
-        int tileK = (int)get_group_id(0) * TILE + lx;
-        yy[ly][lx] = (ym < m && tileN < n) ? dy[ym * n + tileN] : 0.0f;
-        aa[ly][lx] = (am < m && tileK < k) ? a[am * k + tileK] : 0.0f;
+        const int m0 = t + ty;
+        const int m1 = m0 + 1;
+        const int mc0 = t + tx;
+        const int mc1 = mc0 + 1;
+
+        yy[ty][tx] =
+            (m0 < m && n0 < n) ? dy[m0 * n + n0] : 0.0f;
+        yy[ty][tx + 1] =
+            (m0 < m && n1 < n) ? dy[m0 * n + n1] : 0.0f;
+        yy[ty + 1][tx] =
+            (m1 < m && n0 < n) ? dy[m1 * n + n0] : 0.0f;
+        yy[ty + 1][tx + 1] =
+            (m1 < m && n1 < n) ? dy[m1 * n + n1] : 0.0f;
+
+        aa[ty][tx] =
+            (m0 < m && k0 < k) ? a[m0 * k + k0] : 0.0f;
+        aa[ty][tx + 1] =
+            (m0 < m && k1 < k) ? a[m0 * k + k1] : 0.0f;
+        aa[ty + 1][tx] =
+            (m1 < m && k0 < k) ? a[m1 * k + k0] : 0.0f;
+        aa[ty + 1][tx + 1] =
+            (m1 < m && k1 < k) ? a[m1 * k + k1] : 0.0f;
+
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (int q = 0; q < TILE; ++q) acc += yy[ly][q] * aa[q][lx];
+        for (int q = 0; q < TILE; ++q) {
+            const float y0 = yy[q][ty];
+            const float y1 = yy[q][ty + 1];
+            const float a0 = aa[q][tx];
+            const float a1 = aa[q][tx + 1];
+            acc00 += y0 * a0;
+            acc01 += y0 * a1;
+            acc10 += y1 * a0;
+            acc11 += y1 * a1;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (nn < n && kk < k) dw[nn * k + kk] = acc;
+
+    if (n0 < n && k0 < k) dw[n0 * k + k0] = acc00;
+    if (n0 < n && k1 < k) dw[n0 * k + k1] = acc01;
+    if (n1 < n && k0 < k) dw[n1 * k + k0] = acc10;
+    if (n1 < n && k1 < k) dw[n1 * k + k1] = acc11;
 }
 
 __kernel void split_heads(
@@ -949,6 +1032,27 @@ struct ProcessRuntime {
         }
     }
 
+    void enqueue2Micro2x2(cl_kernel kernelValue, size_t x, size_t y) {
+        constexpr size_t MICRO = 2;
+        constexpr size_t LOCAL = 8;
+        const size_t gx = (x + MICRO - 1) / MICRO;
+        const size_t gy = (y + MICRO - 1) / MICRO;
+        const size_t global[2] = {roundUp(gx, LOCAL), roundUp(gy, LOCAL)};
+        const size_t local[2] = {LOCAL, LOCAL};
+        cl_event event = nullptr;
+        cl_event* eventOut = kernelCaptureActive ? &event : nullptr;
+        cl_int ec = api.EnqueueNDRangeKernel(
+            activeQueue(), kernelValue, 2, nullptr, global, local,
+            0, nullptr, eventOut);
+        req(ec == CL_SUCCESS,
+            "clEnqueueNDRangeKernel(2D micro2x2) failed ec=" +
+            std::to_string(ec));
+        if (kernelCaptureActive) {
+            req(event != nullptr, "OpenCL micro2x2 profiling event missing");
+            profiledEvents.push_back({kernelName(kernelValue), event});
+        }
+    }
+
     void finish() {
         cl_int ec = api.Finish(activeQueue());
         req(ec == CL_SUCCESS, "clFinish failed ec=" + std::to_string(ec));
@@ -1509,7 +1613,7 @@ void NativeTrainer::linearDInput(
     runtime_.argument(kernel, 3, m);
     runtime_.argument(kernel, 4, k);
     runtime_.argument(kernel, 5, n);
-    runtime_.enqueue2(kernel, k, m);
+    runtime_.enqueue2Micro2x2(kernel, k, m);
 }
 
 void NativeTrainer::linearDWeight(
@@ -1521,7 +1625,7 @@ void NativeTrainer::linearDWeight(
     runtime_.argument(kernel, 3, m);
     runtime_.argument(kernel, 4, k);
     runtime_.argument(kernel, 5, n);
-    runtime_.enqueue2(kernel, k, n);
+    runtime_.enqueue2Micro2x2(kernel, k, n);
 }
 
 void NativeTrainer::rmsForward(
