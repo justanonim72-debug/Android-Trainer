@@ -3,11 +3,14 @@ package dev.riszn.androidtrainer;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.PowerManager;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -122,6 +125,38 @@ public final class MainActivity extends Activity {
         root.addView(scroller, new LinearLayout.LayoutParams(-1, 0, 1f));
         setContentView(root);
         showPreviousExitDiagnostics();
+        handleLaunchIntent(getIntent());
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleLaunchIntent(intent);
+    }
+
+    private void handleLaunchIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        Uri data = intent.getData();
+        if (data == null) return;
+        if ("androidtrainer".equals(data.getScheme()) &&
+                "gate".equals(data.getHost()) && "/run".equals(data.getPath())) {
+            File existing = new File(getFilesDir(), "gate_bundle");
+            new Thread(() -> {
+                try {
+                    verifyBundleFiles(existing);
+                    String check = nativeValidateBundle(existing.getAbsolutePath());
+                    if (!"PASS".equals(new JSONObject(check).optString("status"))) {
+                        throw new IllegalStateException(check);
+                    }
+                    bundleDir = existing;
+                    runOnUiThread(this::runGate);
+                } catch (Throwable t) {
+                    append("DEEP-LINK GATE FAIL: " + t);
+                }
+            }, "android-trainer-deep-link").start();
+            return;
+        }
+        importBundle(data, true);
     }
 
     private void showPreviousExitDiagnostics() {
@@ -259,6 +294,10 @@ public final class MainActivity extends Activity {
     }
 
     private void importBundle(Uri uri) {
+        importBundle(uri, false);
+    }
+
+    private void importBundle(Uri uri, boolean runAfterImport) {
         append("\n=== IMPORT BUNDLE ===");
         run.setEnabled(false);
         new Thread(() -> {
@@ -284,7 +323,10 @@ public final class MainActivity extends Activity {
                             "native bundle validation failed: " + nativeCheck);
                 }
                 bundleDir = dest;
-                runOnUiThread(() -> run.setEnabled(true));
+                runOnUiThread(() -> {
+                    run.setEnabled(true);
+                    if (runAfterImport) runGate();
+                });
             } catch (Throwable t) {
                 append("IMPORT FAIL: " + t);
             }
@@ -356,6 +398,7 @@ public final class MainActivity extends Activity {
                     os.write(out.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     os.getFD().sync();
                 }
+                publishReport(out);
                 append(pretty(out));
             } catch (Throwable t) {
                 append("GATE FAIL: " + t);
@@ -372,6 +415,31 @@ public final class MainActivity extends Activity {
             catch (Throwable ignored) {}
         }
         return Float.NaN;
+    }
+
+    private void publishReport(String report) {
+        if (Build.VERSION.SDK_INT < 29) return;
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME,
+                "model0001-native-opencl-gate-" + System.currentTimeMillis() + ".json");
+        values.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                Environment.DIRECTORY_DOWNLOADS + "/Android-Trainer");
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri uri = getContentResolver().insert(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) throw new IllegalStateException("cannot create public report");
+        try (OutputStream stream = getContentResolver().openOutputStream(uri, "w")) {
+            if (stream == null) throw new IllegalStateException("null public report stream");
+            stream.write(report.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            getContentResolver().delete(uri, null, null);
+            throw new IllegalStateException("public report write failed", e);
+        }
+        ContentValues ready = new ContentValues();
+        ready.put(MediaStore.MediaColumns.IS_PENDING, 0);
+        getContentResolver().update(uri, ready, null, null);
+        append("public_report_uri: " + uri);
     }
 
     private void exportReport() {
