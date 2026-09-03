@@ -3673,6 +3673,193 @@ NativePilotResult NativeTrainer::runPilot(const PilotPackageData& pilot) {
 }
 
 
+NativePilotResult NativeTrainer::runSftPilot(
+    const SftPilotPackageData& pilot) {
+    mark("native:sft_pilot:initialize:start");
+    req(bundle_.modelStateSha256 ==
+            "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "SFT pilot requires promoted Foundation-v3 source bundle");
+
+    initializeSlots();
+    initializeInputs();
+    initializeActivations();
+
+    const ProbeError weightError = validateWeightLoad();
+    req(std::isfinite(weightError.maxAbs) && weightError.maxAbs == 0.0,
+        "SFT pilot source weight-load verification failed");
+
+    mark("native:sft_pilot:baseline:start");
+    resetToSourceState();
+    const double baselineSft =
+        evaluateSftCe(pilot.sftValidation, pilot.sftEvalIndices);
+    const double baselineV3 =
+        evaluateCe(pilot.v3Validation, pilot.v3EvalIndices);
+    const double baselineV1 =
+        evaluateCe(pilot.v1Validation, pilot.v1EvalIndices);
+    mark("native:sft_pilot:baseline:done");
+
+    struct Candidate {
+        double lr = 0.0;
+        bool pass = false;
+        double seconds = 0.0;
+        double updateTokensPerSecond = 0.0;
+        double scoredTokensPerSecond = 0.0;
+        uint64_t scoredTrainTokens = 0;
+        double firstLossMean = 0.0;
+        double lastLossMean = 0.0;
+        double finalTrainLoss = 0.0;
+        double maxGradNorm = 0.0;
+        double finalSft = 0.0;
+        double finalV3 = 0.0;
+        double finalV1 = 0.0;
+    };
+
+    std::vector<Candidate> results;
+    results.reserve(pilot.lrCandidates.size());
+
+    for (size_t candidateIndex = 0;
+         candidateIndex < pilot.lrCandidates.size(); ++candidateIndex) {
+        const double candidateLr = pilot.lrCandidates[candidateIndex];
+        mark("native:sft_pilot:candidate:" +
+             std::to_string(candidateIndex) + ":reset");
+        resetToSourceState();
+        req(optimizerStep_ == 0,
+            "SFT pilot candidate did not start at step zero");
+
+        std::vector<double> losses;
+        losses.reserve(static_cast<size_t>(pilot.trainSteps));
+        double maxNorm = 0.0;
+        uint64_t scoredTokens = 0;
+
+        mark("native:sft_pilot:candidate:" +
+             std::to_string(candidateIndex) + ":train");
+        const auto started = std::chrono::steady_clock::now();
+        for (int step = 0; step < pilot.trainSteps; ++step) {
+            const int active =
+                setWindowFromSft(pilot.train, pilot.trainIndices[step]);
+            scoredTokens += static_cast<uint64_t>(active);
+            const int warmNumerator =
+                std::min(step + 1, pilot.warmupSteps);
+            const float lr = static_cast<float>(
+                candidateLr *
+                static_cast<double>(warmNumerator) /
+                static_cast<double>(pilot.warmupSteps));
+            setLearningRate(lr);
+            fullTrainingStep();
+            losses.push_back(static_cast<double>(readLoss()));
+            maxNorm = std::max(
+                maxNorm, static_cast<double>(readGlobalNorm()));
+        }
+        runtime_.finish();
+        const auto stopped = std::chrono::steady_clock::now();
+
+        req(optimizerStep_ == static_cast<uint64_t>(pilot.trainSteps),
+            "SFT pilot optimizer-step count mismatch");
+        req(!losses.empty(), "SFT pilot candidate produced no losses");
+        req(scoredTokens > 0, "SFT pilot candidate scored zero assistant tokens");
+
+        const int edge = std::min<int>(12, losses.size());
+        long double first = 0.0, last = 0.0;
+        for (int i = 0; i < edge; ++i) {
+            first += losses[static_cast<size_t>(i)];
+            last += losses[losses.size() - edge + static_cast<size_t>(i)];
+        }
+
+        Candidate result;
+        result.lr = candidateLr;
+        result.seconds = std::chrono::duration<double>(
+            stopped - started).count();
+        result.updateTokensPerSecond =
+            static_cast<double>(pilot.trainSteps) * S /
+            std::max(result.seconds, 1.0e-9);
+        result.scoredTokensPerSecond =
+            static_cast<double>(scoredTokens) /
+            std::max(result.seconds, 1.0e-9);
+        result.scoredTrainTokens = scoredTokens;
+        result.firstLossMean =
+            static_cast<double>(first / static_cast<long double>(edge));
+        result.lastLossMean =
+            static_cast<double>(last / static_cast<long double>(edge));
+        result.finalTrainLoss = losses.back();
+        result.maxGradNorm = maxNorm;
+
+        mark("native:sft_pilot:candidate:" +
+             std::to_string(candidateIndex) + ":evaluate");
+        result.finalSft =
+            evaluateSftCe(pilot.sftValidation, pilot.sftEvalIndices);
+        result.finalV3 =
+            evaluateCe(pilot.v3Validation, pilot.v3EvalIndices);
+        result.finalV1 =
+            evaluateCe(pilot.v1Validation, pilot.v1EvalIndices);
+        result.pass =
+            std::isfinite(result.firstLossMean) &&
+            std::isfinite(result.lastLossMean) &&
+            std::isfinite(result.finalTrainLoss) &&
+            std::isfinite(result.maxGradNorm) &&
+            std::isfinite(result.finalSft) &&
+            std::isfinite(result.finalV3) &&
+            std::isfinite(result.finalV1) &&
+            result.updateTokensPerSecond > 0.0 &&
+            result.scoredTokensPerSecond > 0.0;
+        results.push_back(result);
+    }
+
+    bool allPass = !results.empty();
+    for (const auto& value : results) allPass = allPass && value.pass;
+
+    std::ostringstream out;
+    out << "{\"status\":\"" << (allPass ? "PASS" : "FAIL")
+        << "\",\"schema\":\"model0001_f2_sft_lr_pilot_report_v1\""
+        << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+        << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
+        << ",\"source_model_state_sha256\":"
+        << "\"10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b\""
+        << ",\"objective\":\"assistant_content_only_cross_entropy\""
+        << ",\"fresh_zero_moments_each_candidate\":true"
+        << ",\"train_steps_per_candidate\":" << pilot.trainSteps
+        << ",\"warmup_steps\":" << pilot.warmupSteps
+        << ",\"context_target_positions_per_update\":" << S
+        << ",\"baseline\":{\"sft_validation_ce\":"
+        << std::setprecision(17) << baselineSft
+        << ",\"v3_validation_ce\":" << baselineV3
+        << ",\"v1_validation_ce\":" << baselineV1 << "}"
+        << ",\"candidates\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) out << ",";
+        const auto& value = results[i];
+        out << "{\"lr\":" << std::setprecision(17) << value.lr
+            << ",\"pass\":" << (value.pass ? "true" : "false")
+            << ",\"seconds\":" << value.seconds
+            << ",\"context_target_positions_per_second\":"
+            << value.updateTokensPerSecond
+            << ",\"scored_assistant_tokens\":" << value.scoredTrainTokens
+            << ",\"scored_assistant_tokens_per_second\":"
+            << value.scoredTokensPerSecond
+            << ",\"first_12_train_loss_mean\":" << value.firstLossMean
+            << ",\"last_12_train_loss_mean\":" << value.lastLossMean
+            << ",\"final_train_loss\":" << value.finalTrainLoss
+            << ",\"max_global_grad_norm\":" << value.maxGradNorm
+            << ",\"sft_validation_ce\":" << value.finalSft
+            << ",\"sft_validation_delta\":"
+            << (value.finalSft - baselineSft)
+            << ",\"v3_validation_ce\":" << value.finalV3
+            << ",\"v3_validation_delta\":"
+            << (value.finalV3 - baselineV3)
+            << ",\"v1_validation_ce\":" << value.finalV1
+            << ",\"v1_validation_delta\":"
+            << (value.finalV1 - baselineV1)
+            << "}";
+    }
+    out << "]"
+        << ",\"production_lr_locked\":false"
+        << ",\"test_split_used\":false"
+        << ",\"pass\":" << (allPass ? "true" : "false") << "}";
+
+    mark(allPass ? "native:sft_pilot:pass" : "native:sft_pilot:fail");
+    return NativePilotResult{allPass, out.str()};
+}
+
+
 NativeStageResult NativeTrainer::runStage(const StagePackageData& stage) {
     mark("native:production:initialize:start");
     initializeSlots();
