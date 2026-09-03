@@ -1404,6 +1404,9 @@ struct SftWindowDataFile {
 };
 
 struct SftPilotPackageData {
+    std::string packageSchema;
+    std::string stageName;
+    std::string reportSchema;
     std::vector<double> lrCandidates;
     std::vector<int> trainIndices;
     std::vector<int> sftEvalIndices;
@@ -1465,9 +1468,12 @@ SftPilotPackageData loadSftPilotPackage(const std::string& root) {
     doc.Parse(json.c_str(), json.size());
     req(!doc.HasParseError() && doc.IsObject(),
         "invalid SFT pilot manifest.json");
-    req(doc.HasMember("schema") && doc["schema"].IsString() &&
-            std::string(doc["schema"].GetString()) ==
-                "model0001_f2_sft_lr_pilot_v1",
+    req(doc.HasMember("schema") && doc["schema"].IsString(),
+        "SFT pilot schema missing");
+    const std::string packageSchema = doc["schema"].GetString();
+    const bool isRepair =
+        packageSchema == "model0001_f2r_lr_pilot_v1";
+    req(packageSchema == "model0001_f2_sft_lr_pilot_v1" || isRepair,
         "unsupported SFT pilot schema");
     req(doc.HasMember("source_model_state_sha256") &&
             doc["source_model_state_sha256"].IsString() &&
@@ -1510,6 +1516,30 @@ SftPilotPackageData loadSftPilotPackage(const std::string& root) {
         "SFT pilot protocol malformed");
 
     SftPilotPackageData result;
+    result.packageSchema = packageSchema;
+    result.stageName = isRepair ? "friend_f2r_repair_sft" : "friend_f2_sft";
+    result.reportSchema = isRepair
+        ? "model0001_f2r_lr_pilot_report_v1"
+        : "model0001_f2_sft_lr_pilot_report_v1";
+    if (isRepair) {
+        req(doc.HasMember("stage_objective") &&
+                doc["stage_objective"].IsString() &&
+                std::string(doc["stage_objective"].GetString()) ==
+                    "friend_f2r_repair_sft",
+            "F2R pilot stage objective drift");
+        req(guards.HasMember("record_isolated_packing") &&
+                guards["record_isolated_packing"].IsBool() &&
+                guards["record_isolated_packing"].GetBool(),
+            "F2R pilot record-isolated packing guard missing");
+        req(guards.HasMember("cross_record_windows") &&
+                guards["cross_record_windows"].IsInt() &&
+                guards["cross_record_windows"].GetInt() == 0,
+            "F2R pilot cross-record window guard failed");
+        req(guards.HasMember("behavior_eval_prompts_used_for_train") &&
+                guards["behavior_eval_prompts_used_for_train"].IsBool() &&
+                !guards["behavior_eval_prompts_used_for_train"].GetBool(),
+            "F2R pilot leaked behavior-eval prompts into train");
+    }
     result.trainSteps = protocol["train_steps_per_candidate"].GetInt();
     result.warmupSteps = protocol["warmup_steps"].GetInt();
     req(result.trainSteps == 96 && result.warmupSteps == 3,
@@ -1517,7 +1547,8 @@ SftPilotPackageData loadSftPilotPackage(const std::string& root) {
     for (const auto& value : protocol["lr_candidates"].GetArray()) {
         req(value.IsNumber(), "SFT pilot LR candidate is not numeric");
         const double lr = value.GetDouble();
-        req(std::isfinite(lr) && lr >= 1.0e-5 && lr <= 5.0e-5,
+        const double minPilotLr = isRepair ? 5.0e-6 : 1.0e-5;
+        req(std::isfinite(lr) && lr >= minPilotLr && lr <= 5.0e-5,
             "SFT pilot LR outside locked full-SFT range");
         result.lrCandidates.push_back(lr);
     }
@@ -1568,6 +1599,10 @@ SftPilotPackageData loadSftPilotPackage(const std::string& root) {
 
 
 struct SftStagePackageData {
+    std::string packageSchema;
+    std::string reportSchema;
+    std::string progressSchema;
+    std::string artifactPrefix;
     std::string recipeSha256;
     std::string stageName;
     int totalUpdates = 0;
@@ -1594,10 +1629,13 @@ SftStagePackageData loadSftStagePackage(const std::string& root) {
     doc.Parse(json.c_str(), json.size());
     req(!doc.HasParseError() && doc.IsObject(),
         "invalid F2 SFT stage manifest.json");
-    req(doc.HasMember("schema") && doc["schema"].IsString() &&
-            std::string(doc["schema"].GetString()) ==
-                "model0001_f2_sft_stage_package_v1",
-        "unsupported F2 SFT stage package schema");
+    req(doc.HasMember("schema") && doc["schema"].IsString(),
+        "masked SFT stage schema missing");
+    const std::string packageSchema = doc["schema"].GetString();
+    const bool isRepair =
+        packageSchema == "model0001_f2r_stage_package_v1";
+    req(packageSchema == "model0001_f2_sft_stage_package_v1" || isRepair,
+        "unsupported masked SFT stage package schema");
     req(doc.HasMember("source_model_state_sha256") &&
             doc["source_model_state_sha256"].IsString() &&
             std::string(doc["source_model_state_sha256"].GetString()) ==
@@ -1629,18 +1667,46 @@ SftStagePackageData loadSftStagePackage(const std::string& root) {
         "F2 SFT recipe missing");
     const auto& recipe = doc["recipe"];
     SftStagePackageData result;
+    result.packageSchema = packageSchema;
+    result.reportSchema = isRepair
+        ? "model0001_f2r_stage_report_v1"
+        : "model0001_f2_sft_stage_report_v1";
+    result.progressSchema = isRepair
+        ? "model0001_f2r_stage_progress_v1"
+        : "model0001_f2_sft_stage_progress_v1";
+    result.artifactPrefix = isRepair ? "model0001-f2r" : "model0001-f2-sft";
     result.recipeSha256 = doc["recipe_sha256"].GetString();
     req(result.recipeSha256.size() == 64,
         "F2 SFT recipe SHA length invalid");
-    req(recipe.HasMember("schema") && recipe["schema"].IsString() &&
-            std::string(recipe["schema"].GetString()) ==
-                "model0001_f2_sft_stage_recipe_v1",
-        "F2 SFT recipe schema drift");
-    req(recipe.HasMember("stage_name") && recipe["stage_name"].IsString() &&
-            std::string(recipe["stage_name"].GetString()) ==
-                "friend_f2_sft",
-        "F2 SFT stage name drift");
+    req(recipe.HasMember("schema") && recipe["schema"].IsString(),
+        "masked SFT recipe schema missing");
+    const std::string expectedRecipeSchema = isRepair
+        ? "model0001_f2r_stage_recipe_v1"
+        : "model0001_f2_sft_stage_recipe_v1";
+    req(std::string(recipe["schema"].GetString()) == expectedRecipeSchema,
+        "masked SFT recipe schema drift");
+    req(recipe.HasMember("stage_name") && recipe["stage_name"].IsString(),
+        "masked SFT stage name missing");
+    const std::string expectedStageName = isRepair
+        ? "friend_f2r_repair_sft"
+        : "friend_f2_sft";
+    req(std::string(recipe["stage_name"].GetString()) == expectedStageName,
+        "masked SFT stage name drift");
     result.stageName = recipe["stage_name"].GetString();
+    if (isRepair) {
+        req(guards.HasMember("record_isolated_packing") &&
+                guards["record_isolated_packing"].IsBool() &&
+                guards["record_isolated_packing"].GetBool(),
+            "F2R production record-isolated packing guard missing");
+        req(guards.HasMember("cross_record_windows") &&
+                guards["cross_record_windows"].IsInt() &&
+                guards["cross_record_windows"].GetInt() == 0,
+            "F2R production cross-record window guard failed");
+        req(guards.HasMember("behavior_eval_prompts_used_for_train") &&
+                guards["behavior_eval_prompts_used_for_train"].IsBool() &&
+                !guards["behavior_eval_prompts_used_for_train"].GetBool(),
+            "F2R production behavior-eval prompt leak");
+    }
     req(recipe.HasMember("total_updates") &&
             recipe["total_updates"].IsInt() &&
             recipe["total_updates"].GetInt() > 0,
@@ -1684,10 +1750,13 @@ SftStagePackageData loadSftStagePackage(const std::string& root) {
             recipe["sample_order"].IsObject(),
         "F2 SFT sample_order missing");
     const auto& order = recipe["sample_order"];
-    req(order.HasMember("type") && order["type"].IsString() &&
-            std::string(order["type"].GetString()) ==
-                "sequential_masked_windows",
-        "F2 SFT sample order drift");
+    req(order.HasMember("type") && order["type"].IsString(),
+        "masked SFT sample order type missing");
+    const std::string expectedOrderType = isRepair
+        ? "sequential_record_isolated_masked_windows"
+        : "sequential_masked_windows";
+    req(std::string(order["type"].GetString()) == expectedOrderType,
+        "masked SFT sample order drift");
     req(order.HasMember("seed") && order["seed"].IsInt() &&
             order["seed"].GetInt() == 20260903,
         "F2 SFT sample-order seed drift");
@@ -4086,7 +4155,9 @@ NativePilotResult NativeTrainer::runSftPilot(
 
     std::ostringstream out;
     out << "{\"status\":\"" << (allPass ? "PASS" : "FAIL")
-        << "\",\"schema\":\"model0001_f2_sft_lr_pilot_report_v1\""
+        << "\",\"schema\":\"" << jsonEscape(pilot.reportSchema) << "\""
+        << ",\"stage_name\":\"" << jsonEscape(pilot.stageName) << "\""
+        << ",\"package_schema\":\"" << jsonEscape(pilot.packageSchema) << "\""
         << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
         << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
         << ",\"source_model_state_sha256\":"
@@ -4163,12 +4234,12 @@ NativeStageResult NativeTrainer::runSftStage(
 
     const std::string recipePrefix = stage.recipeSha256.substr(0, 12);
     const std::string checkpointPath =
-        workDirectory_ + "/model0001-f2-sft-" +
+        workDirectory_ + "/" + stage.artifactPrefix + "-" +
         recipePrefix + ".atnckpt";
     const std::string progressPath =
-        workDirectory_ + "/model0001-f2-sft-progress.json";
+        workDirectory_ + "/" + stage.artifactPrefix + "-progress.json";
     const std::string completedPath =
-        workDirectory_ + "/model0001-f2-sft-completed.json";
+        workDirectory_ + "/" + stage.artifactPrefix + "-completed.json";
 
     bool resumed = false;
     if (regularFileExists(checkpointPath)) {
@@ -4218,7 +4289,7 @@ NativeStageResult NativeTrainer::runSftStage(
             : 0.0;
 
         std::ostringstream out;
-        out << "{\"schema\":\"model0001_f2_sft_stage_progress_v1\""
+        out << "{\"schema\":\"" << jsonEscape(stage.progressSchema) << "\""
             << ",\"stage_name\":\"" << jsonEscape(stage.stageName) << "\""
             << ",\"recipe_sha256\":\"" << stage.recipeSha256 << "\""
             << ",\"resumed\":" << (resumed ? "true" : "false")
@@ -4349,7 +4420,7 @@ NativeStageResult NativeTrainer::runSftStage(
 
     std::ostringstream out;
     out << "{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\""
-        << ",\"schema\":\"model0001_f2_sft_stage_report_v1\""
+        << ",\"schema\":\"" << jsonEscape(stage.reportSchema) << "\""
         << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
         << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
         << ",\"stage_name\":\"" << jsonEscape(stage.stageName) << "\""

@@ -90,6 +90,7 @@ jobs:
             tools/audit_model0001_f2_behavior_collapse.py \
             tools/build_model0001_f2r_repair_source.py \
             tools/pack_model0001_f2r_repair.py \
+            tools/build_model0001_f2r_lr_pilot.py \
             tools/build_model0001_stage_package.py
 
       - name: F2 source runtime smoke
