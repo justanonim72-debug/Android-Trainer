@@ -45,6 +45,7 @@ public final class MainActivity extends Activity {
     private static final int REQ_STAGE = 1005;
     private static final int REQ_CHECKPOINT_EXPORT = 1006;
     private static final int REQ_F2_PILOT = 1007;
+    private static final int REQ_F2_STAGE = 1008;
 
     static {
         System.loadLibrary("android_trainer");
@@ -56,10 +57,12 @@ public final class MainActivity extends Activity {
     private Button productionRun;
     private Button exportCheckpoint;
     private Button f2PilotRun;
+    private Button f2ProductionRun;
     private File bundleDir;
     private File pilotDir;
     private File stageDir;
     private File f2PilotDir;
+    private File f2StageDir;
     private String bundleModelStateSha = "";
     private File lastTrainingCheckpoint;
     private volatile boolean trainingActive = false;
@@ -74,6 +77,7 @@ public final class MainActivity extends Activity {
     private static native String nativeRunLrPilot(String bundleDir, String pilotDir, String workDir);
     private static native String nativeRunStage(String bundleDir, String stageDir, String workDir);
     private static native String nativeRunF2SftLrPilot(String bundleDir, String pilotDir, String workDir);
+    private static native String nativeRunF2SftStage(String bundleDir, String stageDir, String workDir);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -151,6 +155,15 @@ public final class MainActivity extends Activity {
         f2PilotRun.setEnabled(false);
         f2PilotRun.setOnClickListener(v -> runF2SftLrPilot());
         buttons.addView(f2PilotRun);
+
+        Button selectF2Stage = button("12. Import locked F2 SFT .atsftstage");
+        selectF2Stage.setOnClickListener(v -> selectF2Stage());
+        buttons.addView(selectF2Stage);
+
+        f2ProductionRun = button("13. Run / resume F2 SFT training");
+        f2ProductionRun.setEnabled(false);
+        f2ProductionRun.setOnClickListener(v -> runF2SftStage());
+        buttons.addView(f2ProductionRun);
 
         Button export = button("Export last JSON report");
         export.setOnClickListener(v -> exportReport());
@@ -348,6 +361,8 @@ public final class MainActivity extends Activity {
             writeTrainingCheckpoint(data.getData());
         if (requestCode == REQ_F2_PILOT)
             importF2Pilot(data.getData());
+        if (requestCode == REQ_F2_STAGE)
+            importF2Stage(data.getData());
     }
 
     private void importBundle(Uri uri) {
@@ -584,6 +599,110 @@ public final class MainActivity extends Activity {
         }
     }
 
+
+    private void selectF2Stage() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_MIME_TYPES,
+                new String[]{"application/zip", "application/octet-stream"});
+        startActivityForResult(i, REQ_F2_STAGE);
+    }
+
+    private void importF2Stage(Uri uri) {
+        append("\n=== IMPORT F2 SFT PRODUCTION STAGE ===");
+        if (f2ProductionRun != null) f2ProductionRun.setEnabled(false);
+        new Thread(() -> {
+            try {
+                File zip = new File(
+                        getFilesDir(), "model0001-f2-sft.atsftstage");
+                try (InputStream in = getContentResolver().openInputStream(uri);
+                     OutputStream out =
+                             new BufferedOutputStream(new FileOutputStream(zip))) {
+                    if (in == null)
+                        throw new IllegalStateException(
+                                "content resolver returned null F2 stage stream");
+                    copy(in, out);
+                }
+                String packageSha = sha256(zip);
+                File dest = new File(getFilesDir(), "f2_sft_stage_bundle");
+                deleteTree(dest);
+                if (!dest.mkdirs() && !dest.isDirectory())
+                    throw new IllegalStateException("cannot create F2 stage dir");
+                unzipSafely(zip, dest);
+                verifyF2StageFiles(dest);
+                f2StageDir = dest;
+                append("f2_sft_stage_sha256: " + packageSha);
+                append("F2 SFT production stage verification: PASS");
+                runOnUiThread(this::updateF2ProductionEnabled);
+            } catch (Throwable t) {
+                append("F2 STAGE IMPORT FAIL: " + t);
+            }
+        }, "android-trainer-f2-stage-import").start();
+    }
+
+    private void verifyF2StageFiles(File root) throws Exception {
+        File manifestFile = new File(root, "manifest.json");
+        if (!manifestFile.isFile())
+            throw new IllegalStateException("F2 stage manifest.json missing");
+        String text = new String(
+                java.nio.file.Files.readAllBytes(manifestFile.toPath()),
+                java.nio.charset.StandardCharsets.UTF_8);
+        JSONObject manifest = new JSONObject(text);
+        if (!"model0001_f2_sft_stage_package_v1".equals(
+                manifest.getString("schema")))
+            throw new IllegalStateException("wrong F2 stage schema");
+        if (!"10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b"
+                .equals(manifest.getString("source_model_state_sha256")))
+            throw new IllegalStateException("F2 stage source-model SHA mismatch");
+        if (!"assistant_content_only_cross_entropy".equals(
+                manifest.getString("objective")))
+            throw new IllegalStateException("F2 stage objective drift");
+        JSONObject guards = manifest.getJSONObject("hard_guards");
+        if (!guards.getBoolean("assistant_only_loss"))
+            throw new IllegalStateException("F2 stage assistant-only guard missing");
+        if (guards.getBoolean("test_split_packaged"))
+            throw new IllegalStateException("F2 stage contains test split");
+        if (guards.getBoolean("foundation_v3_train_bin_packaged"))
+            throw new IllegalStateException("F2 stage contains Foundation-v3 train");
+
+        JSONObject recipe = manifest.getJSONObject("recipe");
+        if (!"friend_f2_sft".equals(recipe.getString("stage_name")))
+            throw new IllegalStateException("F2 stage-name drift");
+        if (!"fresh_zero_moments".equals(recipe.getString("optimizer_init")))
+            throw new IllegalStateException("F2 optimizer-init drift");
+        if (recipe.getBoolean("test_split_used"))
+            throw new IllegalStateException("F2 recipe touches test split");
+
+        JSONObject data = manifest.getJSONObject("data");
+        String[] masked = new String[]{"sft_train", "sft_validation"};
+        for (String key : masked) {
+            JSONObject spec = data.getJSONObject(key);
+            int windows = spec.getInt("windows");
+            File tokens = canonicalChild(root, spec.getString("tokens_path"));
+            File mask = canonicalChild(root, spec.getString("mask_path"));
+            if (!tokens.isFile() || !mask.isFile())
+                throw new IllegalStateException("F2 stage masked data missing: " + key);
+            if (tokens.length() != (long) windows * 257L * 2L)
+                throw new IllegalStateException("F2 stage tokens size mismatch: " + key);
+            if (mask.length() != (long) windows * 256L)
+                throw new IllegalStateException("F2 stage mask size mismatch: " + key);
+            if (!sha256(tokens).equalsIgnoreCase(spec.getString("tokens_sha256")))
+                throw new IllegalStateException("F2 stage tokens SHA mismatch: " + key);
+            if (!sha256(mask).equalsIgnoreCase(spec.getString("mask_sha256")))
+                throw new IllegalStateException("F2 stage mask SHA mismatch: " + key);
+        }
+        for (String key : new String[]{"v3_validation", "v1_validation"}) {
+            JSONObject spec = data.getJSONObject(key);
+            File file = canonicalChild(root, spec.getString("path"));
+            if (!file.isFile() ||
+                    file.length() != spec.getLong("uint16_tokens") * 2L)
+                throw new IllegalStateException("F2 retention data mismatch: " + key);
+            if (!sha256(file).equalsIgnoreCase(spec.getString("sha256")))
+                throw new IllegalStateException("F2 retention SHA mismatch: " + key);
+        }
+    }
+
     private void selectStage() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -682,7 +801,14 @@ public final class MainActivity extends Activity {
         if (f2PilotRun != null)
             f2PilotRun.setEnabled(
                     bundleDir != null && f2PilotDir != null &&
-                    isFoundationV3Source());
+                    isFoundationV3Source() && !trainingActive);
+    }
+
+    private void updateF2ProductionEnabled() {
+        if (f2ProductionRun != null)
+            f2ProductionRun.setEnabled(
+                    bundleDir != null && f2StageDir != null &&
+                    isFoundationV3Source() && !trainingActive);
     }
 
     private void updateAllModeButtons() {
@@ -691,6 +817,7 @@ public final class MainActivity extends Activity {
         updatePilotEnabled();
         updateProductionEnabled();
         updateF2PilotEnabled();
+        updateF2ProductionEnabled();
     }
 
     private void restoreExistingPackages() {
@@ -742,6 +869,17 @@ public final class MainActivity extends Activity {
                 }
             } catch (Throwable t) {
                 append("existing F2 pilot restore skipped: " + t);
+            }
+            try {
+                File existingF2Stage =
+                        new File(getFilesDir(), "f2_sft_stage_bundle");
+                if (existingF2Stage.isDirectory()) {
+                    verifyF2StageFiles(existingF2Stage);
+                    f2StageDir = existingF2Stage;
+                    append("restored F2 SFT production stage package");
+                }
+            } catch (Throwable t) {
+                append("existing F2 stage restore skipped: " + t);
             }
             runOnUiThread(this::updateAllModeButtons);
         }, "android-trainer-restore").start();
@@ -956,6 +1094,125 @@ public final class MainActivity extends Activity {
     }
 
 
+
+    private void runF2SftStage() {
+        if (bundleDir == null || f2StageDir == null ||
+                !isFoundationV3Source() || trainingActive) return;
+        append("\n=== F2 SFT PRODUCTION TRAINING ===");
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        trainingActive = true;
+        updateAllModeButtons();
+
+        startF2ProgressWatcher();
+
+        new Thread(() -> {
+            PowerManager.WakeLock wl = null;
+            try {
+                wl = powerManager.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "AndroidTrainer:F2SftProduction");
+                wl.acquire(8L * 60L * 60L * 1000L);
+                float thermalStart = thermalHeadroom();
+                long startNs = android.os.SystemClock.elapsedRealtimeNanos();
+                String out = nativeRunF2SftStage(
+                        bundleDir.getAbsolutePath(),
+                        f2StageDir.getAbsolutePath(),
+                        getFilesDir().getAbsolutePath());
+                float thermalEnd = thermalHeadroom();
+                double seconds =
+                        (android.os.SystemClock.elapsedRealtimeNanos() - startNs)
+                                / 1.0e9;
+                try {
+                    JSONObject reportObj = new JSONObject(out);
+                    reportObj.put(
+                            "thermal_headroom_start",
+                            Float.isNaN(thermalStart)
+                                    ? JSONObject.NULL : thermalStart);
+                    reportObj.put(
+                            "thermal_headroom_end",
+                            Float.isNaN(thermalEnd)
+                                    ? JSONObject.NULL : thermalEnd);
+                    reportObj.put("app_stage_wall_seconds", seconds);
+                    JSONObject checkpoint =
+                            reportObj.optJSONObject("checkpoint");
+                    if (checkpoint != null) {
+                        String path = checkpoint.optString("path", "");
+                        if (!path.isEmpty()) {
+                            File file = new File(path);
+                            if (file.isFile()) lastTrainingCheckpoint = file;
+                        }
+                    }
+                    out = reportObj.toString();
+                } catch (Exception ignored) {}
+                lastReport = out;
+                File report =
+                        new File(getFilesDir(), "last_f2_sft_stage_report.json");
+                try (FileOutputStream os = new FileOutputStream(report)) {
+                    os.write(out.getBytes(
+                            java.nio.charset.StandardCharsets.UTF_8));
+                    os.getFD().sync();
+                }
+                publishReport(out);
+                append(pretty(out));
+            } catch (Throwable t) {
+                append("F2 SFT TRAINING FAIL: " + t);
+            } finally {
+                trainingActive = false;
+                if (wl != null && wl.isHeld()) wl.release();
+                runOnUiThread(() -> {
+                    getWindow().clearFlags(
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    updateAllModeButtons();
+                    if (exportCheckpoint != null)
+                        exportCheckpoint.setEnabled(
+                                lastTrainingCheckpoint != null &&
+                                lastTrainingCheckpoint.isFile());
+                });
+            }
+        }, "android-trainer-f2-sft-production").start();
+    }
+
+    private void startF2ProgressWatcher() {
+        new Thread(() -> {
+            String previous = "";
+            File progress =
+                    new File(getFilesDir(), "model0001-f2-sft-progress.json");
+            while (trainingActive) {
+                try {
+                    if (progress.isFile()) {
+                        String raw = new String(
+                                java.nio.file.Files.readAllBytes(progress.toPath()),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        if (!raw.equals(previous)) {
+                            previous = raw;
+                            JSONObject p = new JSONObject(raw);
+                            append(String.format(
+                                    Locale.ROOT,
+                                    "F2 %d/%d  %.2f%%  scored=%d  lr=%.3g  loss=%s  sft=%s  v3=%s  v1=%s",
+                                    p.optInt("optimizer_step", 0),
+                                    p.optInt("total_updates", 0),
+                                    100.0 * p.optDouble("fraction_complete", 0.0),
+                                    p.optLong("scored_assistant_tokens", 0L),
+                                    p.optDouble("learning_rate", Double.NaN),
+                                    String.valueOf(p.opt("last_train_loss")),
+                                    String.valueOf(p.opt("latest_sft_validation_ce")),
+                                    String.valueOf(p.opt("latest_v3_validation_ce")),
+                                    String.valueOf(p.opt("latest_v1_validation_ce"))));
+                        }
+                    }
+                    Thread.sleep(10000L);
+                } catch (InterruptedException e) {
+                    return;
+                } catch (Throwable t) {
+                    append("F2 progress watcher: " + t);
+                    try { Thread.sleep(10000L); }
+                    catch (InterruptedException e) { return; }
+                }
+            }
+        }, "android-trainer-f2-progress-watch").start();
+    }
+
+
     private void runProductionStage() {
         if (bundleDir == null || stageDir == null || trainingActive) return;
         append("\n=== FOUNDATION-v3 PRODUCTION TRAINING ===");
@@ -1152,6 +1409,9 @@ public final class MainActivity extends Activity {
             } else if ("model0001_f2_sft_lr_pilot_report_v1".equals(
                     reportObj.optString("schema"))) {
                 reportPrefix = "model0001-f2-sft-lr-pilot-";
+            } else if ("model0001_f2_sft_stage_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                reportPrefix = "model0001-f2-sft-stage-";
             }
         } catch (Exception ignored) {}
         values.put(MediaStore.MediaColumns.DISPLAY_NAME,
@@ -1196,6 +1456,9 @@ public final class MainActivity extends Activity {
             } else if ("model0001_f2_sft_lr_pilot_report_v1".equals(
                     reportObj.optString("schema"))) {
                 title = "model0001-f2-sft-lr-pilot-report.json";
+            } else if ("model0001_f2_sft_stage_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                title = "model0001-f2-sft-stage-report.json";
             }
         } catch (Exception ignored) {}
         i.putExtra(Intent.EXTRA_TITLE, title);

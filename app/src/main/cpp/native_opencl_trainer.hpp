@@ -43,6 +43,12 @@ struct NativeStageResult {
     std::string json;
 };
 
+// Runs or resumes the locked Friend-Core F2 assistant-only SFT stage.
+NativeStageResult runNativeModel0001SftStage(
+    const Bundle& bundle,
+    const std::string& stageRoot,
+    const std::string& workDir);
+
 // Runs or resumes the recipe-driven Foundation-v3 production stage.
 // The stage package is data+recipe only; source weights come from the same
 // immutable CPT-v2 .atb bundle used by the accepted GPU gate.

@@ -1567,6 +1567,282 @@ SftPilotPackageData loadSftPilotPackage(const std::string& root) {
 }
 
 
+struct SftStagePackageData {
+    std::string recipeSha256;
+    std::string stageName;
+    int totalUpdates = 0;
+    int maxEpochs = 0;
+    int checkpointEvery = 0;
+    int evalEvery = 0;
+    int logEvery = 0;
+    bool constantSchedule = false;
+    double peakLr = 0.0;
+    double minLr = 0.0;
+    int warmupSteps = 0;
+    SftWindowDataFile train;
+    SftWindowDataFile sftValidation;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+    std::vector<int> sftEvalIndices;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+};
+
+SftStagePackageData loadSftStagePackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid F2 SFT stage manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_f2_sft_stage_package_v1",
+        "unsupported F2 SFT stage package schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "F2 SFT stage source model SHA mismatch");
+    req(doc.HasMember("objective") && doc["objective"].IsString() &&
+            std::string(doc["objective"].GetString()) ==
+                "assistant_content_only_cross_entropy",
+        "F2 SFT production objective drift");
+    req(doc.HasMember("recipe_sha256") && doc["recipe_sha256"].IsString(),
+        "F2 SFT recipe SHA missing");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "F2 SFT stage hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("assistant_only_loss") &&
+            guards["assistant_only_loss"].IsBool() &&
+            guards["assistant_only_loss"].GetBool(),
+        "F2 SFT assistant-only guard missing");
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "F2 SFT stage package contains test split");
+    req(guards.HasMember("foundation_v3_train_bin_packaged") &&
+            guards["foundation_v3_train_bin_packaged"].IsBool() &&
+            !guards["foundation_v3_train_bin_packaged"].GetBool(),
+        "F2 SFT stage package contains Foundation-v3 train");
+
+    req(doc.HasMember("recipe") && doc["recipe"].IsObject(),
+        "F2 SFT recipe missing");
+    const auto& recipe = doc["recipe"];
+    SftStagePackageData result;
+    result.recipeSha256 = doc["recipe_sha256"].GetString();
+    req(result.recipeSha256.size() == 64,
+        "F2 SFT recipe SHA length invalid");
+    req(recipe.HasMember("schema") && recipe["schema"].IsString() &&
+            std::string(recipe["schema"].GetString()) ==
+                "model0001_f2_sft_stage_recipe_v1",
+        "F2 SFT recipe schema drift");
+    req(recipe.HasMember("stage_name") && recipe["stage_name"].IsString() &&
+            std::string(recipe["stage_name"].GetString()) ==
+                "friend_f2_sft",
+        "F2 SFT stage name drift");
+    result.stageName = recipe["stage_name"].GetString();
+    req(recipe.HasMember("total_updates") &&
+            recipe["total_updates"].IsInt() &&
+            recipe["total_updates"].GetInt() > 0,
+        "F2 SFT total_updates invalid");
+    result.totalUpdates = recipe["total_updates"].GetInt();
+    req(recipe.HasMember("max_epochs") && recipe["max_epochs"].IsInt() &&
+            recipe["max_epochs"].GetInt() >= 1 &&
+            recipe["max_epochs"].GetInt() <= 3,
+        "F2 SFT max_epochs invalid");
+    result.maxEpochs = recipe["max_epochs"].GetInt();
+    req(recipe.HasMember("optimizer_init") &&
+            recipe["optimizer_init"].IsString() &&
+            std::string(recipe["optimizer_init"].GetString()) ==
+                "fresh_zero_moments",
+        "F2 SFT optimizer init drift");
+    req(recipe.HasMember("source_foundation_lifetime_tokens") &&
+            recipe["source_foundation_lifetime_tokens"].IsInt() &&
+            recipe["source_foundation_lifetime_tokens"].GetInt() == 6563072,
+        "F2 SFT source lifetime boundary drift");
+
+    req(recipe.HasMember("optimizer") && recipe["optimizer"].IsObject(),
+        "F2 SFT optimizer missing");
+    const auto& optimizer = recipe["optimizer"];
+    req(optimizer.HasMember("name") && optimizer["name"].IsString() &&
+            std::string(optimizer["name"].GetString()) == "AdamW",
+        "F2 SFT optimizer must be AdamW");
+    req(optimizer.HasMember("betas") && optimizer["betas"].IsArray() &&
+            optimizer["betas"].Size() == 2 &&
+            std::abs(optimizer["betas"][0].GetDouble() - 0.9) <= 1.0e-12 &&
+            std::abs(optimizer["betas"][1].GetDouble() - 0.95) <= 1.0e-12,
+        "F2 SFT AdamW betas drift");
+    req(optimizer.HasMember("eps") && optimizer["eps"].IsNumber() &&
+            std::abs(optimizer["eps"].GetDouble() - 1.0e-8) <= 1.0e-16,
+        "F2 SFT AdamW eps drift");
+    req(optimizer.HasMember("grad_clip") &&
+            optimizer["grad_clip"].IsNumber() &&
+            std::abs(optimizer["grad_clip"].GetDouble() - 1.0) <= 1.0e-12,
+        "F2 SFT grad clip drift");
+
+    req(recipe.HasMember("sample_order") &&
+            recipe["sample_order"].IsObject(),
+        "F2 SFT sample_order missing");
+    const auto& order = recipe["sample_order"];
+    req(order.HasMember("type") && order["type"].IsString() &&
+            std::string(order["type"].GetString()) ==
+                "sequential_masked_windows",
+        "F2 SFT sample order drift");
+    req(order.HasMember("seed") && order["seed"].IsInt() &&
+            order["seed"].GetInt() == 20260903,
+        "F2 SFT sample-order seed drift");
+
+    req(recipe.HasMember("checkpoint_every") &&
+            recipe["checkpoint_every"].IsInt() &&
+            recipe["checkpoint_every"].GetInt() > 0 &&
+            recipe.HasMember("eval_every") &&
+            recipe["eval_every"].IsInt() &&
+            recipe["eval_every"].GetInt() > 0 &&
+            recipe.HasMember("log_every") &&
+            recipe["log_every"].IsInt() &&
+            recipe["log_every"].GetInt() > 0,
+        "F2 SFT cadence invalid");
+    result.checkpointEvery = recipe["checkpoint_every"].GetInt();
+    result.evalEvery = recipe["eval_every"].GetInt();
+    result.logEvery = recipe["log_every"].GetInt();
+    req(recipe.HasMember("test_split_used") &&
+            recipe["test_split_used"].IsBool() &&
+            !recipe["test_split_used"].GetBool(),
+        "F2 SFT test split must remain untouched");
+
+    req(recipe.HasMember("lr_schedule") &&
+            recipe["lr_schedule"].IsObject(),
+        "F2 SFT LR schedule missing");
+    const auto& schedule = recipe["lr_schedule"];
+    req(schedule.HasMember("type") && schedule["type"].IsString(),
+        "F2 SFT LR schedule type missing");
+    const std::string scheduleType = schedule["type"].GetString();
+    if (scheduleType == "constant") {
+        req(schedule.HasMember("lr") && schedule["lr"].IsNumber(),
+            "F2 SFT constant LR missing");
+        result.constantSchedule = true;
+        result.peakLr = schedule["lr"].GetDouble();
+        result.minLr = result.peakLr;
+        result.warmupSteps = 0;
+    } else {
+        req(scheduleType == "linear_warmup_cosine",
+            "unsupported F2 SFT LR schedule");
+        req(schedule.HasMember("peak_lr") &&
+                schedule["peak_lr"].IsNumber() &&
+                schedule.HasMember("min_lr") &&
+                schedule["min_lr"].IsNumber() &&
+                schedule.HasMember("warmup_steps") &&
+                schedule["warmup_steps"].IsInt(),
+            "F2 SFT warmup/cosine schedule malformed");
+        result.constantSchedule = false;
+        result.peakLr = schedule["peak_lr"].GetDouble();
+        result.minLr = schedule["min_lr"].GetDouble();
+        result.warmupSteps = schedule["warmup_steps"].GetInt();
+    }
+    req(std::isfinite(result.peakLr) && std::isfinite(result.minLr) &&
+            result.peakLr >= 1.0e-6 && result.peakLr <= 5.0e-5 &&
+            result.minLr >= 1.0e-6 &&
+            result.minLr <= result.peakLr,
+        "F2 SFT production LR range invalid");
+    if (!result.constantSchedule) {
+        req(result.warmupSteps > 0 &&
+                result.warmupSteps < result.totalUpdates,
+            "F2 SFT warmup length invalid");
+    }
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "F2 SFT data section missing");
+    const auto& data = doc["data"];
+    result.train = loadSftWindowDataFile(root, data, "sft_train");
+    result.sftValidation =
+        loadSftWindowDataFile(root, data, "sft_validation");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+    req(result.totalUpdates <=
+            result.train.windows * result.maxEpochs,
+        "F2 SFT total_updates exceeds explicit max_epochs");
+
+    req(doc.HasMember("eval_indices") &&
+            doc["eval_indices"].IsObject(),
+        "F2 SFT eval indices missing");
+    const auto& eval = doc["eval_indices"];
+    result.sftEvalIndices = readIndexArray(eval, "sft_validation");
+    result.v3EvalIndices = readIndexArray(eval, "v3_validation");
+    result.v1EvalIndices = readIndexArray(eval, "v1_validation");
+
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("F2 SFT eval index outside ") + label);
+        }
+    };
+    validateIndices(
+        result.sftEvalIndices, result.sftValidation.windows,
+        "SFT validation");
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows,
+        "V3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows,
+        "V1 validation");
+    return result;
+}
+
+double sftStageLearningRate(
+    const SftStagePackageData& stage, int updateIndex) {
+    req(updateIndex >= 0 && updateIndex < stage.totalUpdates,
+        "F2 SFT LR update index invalid");
+    if (stage.constantSchedule) return stage.peakLr;
+    const int updateNumber = updateIndex + 1;
+    if (updateNumber <= stage.warmupSteps) {
+        return stage.peakLr *
+            static_cast<double>(updateNumber) /
+            static_cast<double>(stage.warmupSteps);
+    }
+    const int decaySteps = stage.totalUpdates - stage.warmupSteps;
+    const double progress = std::min(
+        1.0,
+        std::max(
+            0.0,
+            static_cast<double>(updateNumber - stage.warmupSteps) /
+                static_cast<double>(decaySteps)));
+    constexpr double PI = 3.1415926535897932384626433832795;
+    const double cosine = 0.5 * (1.0 + std::cos(PI * progress));
+    return stage.minLr +
+        (stage.peakLr - stage.minLr) * cosine;
+}
+
+int sftWindowActiveTargets(
+    const SftWindowDataFile& data, int windowIndex) {
+    req(windowIndex >= 0 && windowIndex < data.windows,
+        "F2 SFT active-target window out of range");
+    const size_t offset = static_cast<size_t>(windowIndex) * S;
+    int active = 0;
+    for (int i = 0; i < S; ++i) {
+        active += static_cast<int>(
+            data.masks[offset + static_cast<size_t>(i)]);
+    }
+    req(active > 0 && active <= S,
+        "F2 SFT window has invalid active-target count");
+    return active;
+}
+
+uint64_t sftScoredTargetsBeforeStep(
+    const SftStagePackageData& stage, uint64_t step) {
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < step; ++i) {
+        const int windowIndex =
+            static_cast<int>(i % static_cast<uint64_t>(stage.train.windows));
+        total += static_cast<uint64_t>(
+            sftWindowActiveTargets(stage.train, windowIndex));
+    }
+    return total;
+}
+
+
 struct StagePackageData {
     std::string recipeSha256;
     std::string stageName;
@@ -1803,6 +2079,7 @@ public:
     NativeGateResult run(const std::function<double()>& cpuBaseline);
     NativePilotResult runPilot(const PilotPackageData& pilot);
     NativePilotResult runSftPilot(const SftPilotPackageData& pilot);
+    NativeStageResult runSftStage(const SftStagePackageData& stage);
     NativeStageResult runStage(const StagePackageData& stage);
     const std::string& currentStage() const { return currentStage_; }
 
@@ -3860,6 +4137,272 @@ NativePilotResult NativeTrainer::runSftPilot(
 }
 
 
+
+NativeStageResult NativeTrainer::runSftStage(
+    const SftStagePackageData& stage) {
+    mark("native:f2_sft:initialize:start");
+    req(bundle_.modelStateSha256 ==
+            "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "F2 SFT production requires promoted Foundation-v3 source bundle");
+
+    initializeSlots();
+    initializeInputs();
+    initializeActivations();
+    const ProbeError weightError = validateWeightLoad();
+    req(std::isfinite(weightError.maxAbs) && weightError.maxAbs == 0.0,
+        "F2 SFT source weight-load verification failed");
+
+    mark("native:f2_sft:source_baseline:start");
+    const double baselineSft =
+        evaluateSftCe(stage.sftValidation, stage.sftEvalIndices);
+    const double baselineV3 =
+        evaluateCe(stage.v3Validation, stage.v3EvalIndices);
+    const double baselineV1 =
+        evaluateCe(stage.v1Validation, stage.v1EvalIndices);
+    mark("native:f2_sft:source_baseline:done");
+
+    const std::string recipePrefix = stage.recipeSha256.substr(0, 12);
+    const std::string checkpointPath =
+        workDirectory_ + "/model0001-f2-sft-" +
+        recipePrefix + ".atnckpt";
+    const std::string progressPath =
+        workDirectory_ + "/model0001-f2-sft-progress.json";
+    const std::string completedPath =
+        workDirectory_ + "/model0001-f2-sft-completed.json";
+
+    bool resumed = false;
+    if (regularFileExists(checkpointPath)) {
+        mark("native:f2_sft:resume:load_checkpoint");
+        loadCheckpoint(checkpointPath);
+        resumed = true;
+    } else {
+        mark("native:f2_sft:fresh_zero_reset");
+        resetToSourceState();
+    }
+    req(optimizerStep_ <= static_cast<uint64_t>(stage.totalUpdates),
+        "F2 SFT checkpoint step exceeds recipe");
+    const uint64_t startingStep = optimizerStep_;
+    const uint64_t scoredBeforeStart =
+        sftScoredTargetsBeforeStep(stage, startingStep);
+    uint64_t scoredThroughRun = scoredBeforeStart;
+
+    double latestSft = std::numeric_limits<double>::quiet_NaN();
+    double latestV3 = std::numeric_limits<double>::quiet_NaN();
+    double latestV1 = std::numeric_limits<double>::quiet_NaN();
+    int latestEvalStep = -1;
+    double latestTrainLoss = std::numeric_limits<double>::quiet_NaN();
+    double latestGradNorm = std::numeric_limits<double>::quiet_NaN();
+    double latestLr = startingStep < static_cast<uint64_t>(stage.totalUpdates)
+        ? sftStageLearningRate(stage, static_cast<int>(startingStep))
+        : sftStageLearningRate(stage, stage.totalUpdates - 1);
+    size_t latestCheckpointBytes = 0;
+
+    const auto sessionStarted = std::chrono::steady_clock::now();
+
+    auto writeProgress = [&](bool complete) {
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds =
+            std::chrono::duration<double>(now - sessionStarted).count();
+        const uint64_t sessionUpdates = optimizerStep_ - startingStep;
+        const uint64_t sessionScored =
+            scoredThroughRun >= scoredBeforeStart
+                ? scoredThroughRun - scoredBeforeStart
+                : 0;
+        const double contextTps = sessionUpdates > 0
+            ? static_cast<double>(sessionUpdates) * S /
+                std::max(seconds, 1.0e-9)
+            : 0.0;
+        const double scoredTps = sessionScored > 0
+            ? static_cast<double>(sessionScored) /
+                std::max(seconds, 1.0e-9)
+            : 0.0;
+
+        std::ostringstream out;
+        out << "{\"schema\":\"model0001_f2_sft_stage_progress_v1\""
+            << ",\"stage_name\":\"" << jsonEscape(stage.stageName) << "\""
+            << ",\"recipe_sha256\":\"" << stage.recipeSha256 << "\""
+            << ",\"resumed\":" << (resumed ? "true" : "false")
+            << ",\"starting_optimizer_step\":" << startingStep
+            << ",\"optimizer_step\":" << optimizerStep_
+            << ",\"total_updates\":" << stage.totalUpdates
+            << ",\"fraction_complete\":"
+            << (static_cast<double>(optimizerStep_) /
+                static_cast<double>(stage.totalUpdates))
+            << ",\"scored_assistant_tokens\":" << scoredThroughRun
+            << ",\"learning_rate\":" << std::setprecision(17) << latestLr
+            << ",\"last_train_loss\":";
+        if (std::isfinite(latestTrainLoss)) out << latestTrainLoss;
+        else out << "null";
+        out << ",\"last_global_grad_norm\":";
+        if (std::isfinite(latestGradNorm)) out << latestGradNorm;
+        else out << "null";
+        out << ",\"latest_eval_step\":" << latestEvalStep
+            << ",\"latest_sft_validation_ce\":";
+        if (std::isfinite(latestSft)) out << latestSft;
+        else out << "null";
+        out << ",\"latest_v3_validation_ce\":";
+        if (std::isfinite(latestV3)) out << latestV3;
+        else out << "null";
+        out << ",\"latest_v1_validation_ce\":";
+        if (std::isfinite(latestV1)) out << latestV1;
+        else out << "null";
+        out << ",\"session_wall_seconds\":" << seconds
+            << ",\"session_context_positions_per_second\":" << contextTps
+            << ",\"session_scored_assistant_tokens_per_second\":" << scoredTps
+            << ",\"checkpoint_path\":\"" << jsonEscape(checkpointPath) << "\""
+            << ",\"complete\":" << (complete ? "true" : "false")
+            << "}";
+        const std::string text = out.str();
+        atomicWrite(progressPath, text.data(), text.size());
+    };
+
+    writeProgress(startingStep == static_cast<uint64_t>(stage.totalUpdates));
+
+    for (int step = static_cast<int>(startingStep);
+         step < stage.totalUpdates; ++step) {
+        mark("native:f2_sft:train:step:" + std::to_string(step + 1));
+        const int windowIndex = step % stage.train.windows;
+        const int active = setWindowFromSft(stage.train, windowIndex);
+        scoredThroughRun += static_cast<uint64_t>(active);
+        latestLr = sftStageLearningRate(stage, step);
+        setLearningRate(static_cast<float>(latestLr));
+        fullTrainingStep();
+
+        const int completed = step + 1;
+        const bool logDue = completed % stage.logEvery == 0;
+        const bool evalDue =
+            completed % stage.evalEvery == 0 &&
+            completed < stage.totalUpdates;
+        const bool checkpointDue =
+            completed % stage.checkpointEvery == 0 &&
+            completed < stage.totalUpdates;
+
+        if (logDue || evalDue || checkpointDue ||
+            completed == stage.totalUpdates) {
+            latestTrainLoss = static_cast<double>(readLoss());
+            latestGradNorm = static_cast<double>(readGlobalNorm());
+        }
+
+        if (evalDue) {
+            mark("native:f2_sft:evaluate:step:" +
+                 std::to_string(completed));
+            latestSft =
+                evaluateSftCe(stage.sftValidation, stage.sftEvalIndices);
+            latestV3 =
+                evaluateCe(stage.v3Validation, stage.v3EvalIndices);
+            latestV1 =
+                evaluateCe(stage.v1Validation, stage.v1EvalIndices);
+            latestEvalStep = completed;
+        }
+
+        if (checkpointDue) {
+            mark("native:f2_sft:checkpoint:step:" +
+                 std::to_string(completed));
+            saveCheckpoint(checkpointPath, &latestCheckpointBytes);
+        }
+
+        if (logDue || evalDue || checkpointDue) {
+            writeProgress(false);
+        }
+    }
+
+    req(optimizerStep_ == static_cast<uint64_t>(stage.totalUpdates),
+        "F2 SFT stage ended at wrong optimizer step");
+
+    mark("native:f2_sft:final_evaluation");
+    latestSft =
+        evaluateSftCe(stage.sftValidation, stage.sftEvalIndices);
+    latestV3 =
+        evaluateCe(stage.v3Validation, stage.v3EvalIndices);
+    latestV1 =
+        evaluateCe(stage.v1Validation, stage.v1EvalIndices);
+    latestEvalStep = stage.totalUpdates;
+
+    mark("native:f2_sft:final_checkpoint");
+    saveCheckpoint(checkpointPath, &latestCheckpointBytes);
+    runtime_.finish();
+
+    const auto sessionStopped = std::chrono::steady_clock::now();
+    const double sessionSeconds = std::chrono::duration<double>(
+        sessionStopped - sessionStarted).count();
+    const uint64_t sessionUpdates = optimizerStep_ - startingStep;
+    const uint64_t sessionScored =
+        scoredThroughRun - scoredBeforeStart;
+    const double contextTps = sessionUpdates > 0
+        ? static_cast<double>(sessionUpdates) * S /
+            std::max(sessionSeconds, 1.0e-9)
+        : 0.0;
+    const double scoredTps = sessionScored > 0
+        ? static_cast<double>(sessionScored) /
+            std::max(sessionSeconds, 1.0e-9)
+        : 0.0;
+
+    const bool pass =
+        std::isfinite(baselineSft) &&
+        std::isfinite(baselineV3) &&
+        std::isfinite(baselineV1) &&
+        std::isfinite(latestSft) &&
+        std::isfinite(latestV3) &&
+        std::isfinite(latestV1) &&
+        optimizerStep_ == static_cast<uint64_t>(stage.totalUpdates) &&
+        latestCheckpointBytes > 0;
+
+    std::ostringstream out;
+    out << "{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\""
+        << ",\"schema\":\"model0001_f2_sft_stage_report_v1\""
+        << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+        << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
+        << ",\"stage_name\":\"" << jsonEscape(stage.stageName) << "\""
+        << ",\"objective\":\"assistant_content_only_cross_entropy\""
+        << ",\"recipe_sha256\":\"" << stage.recipeSha256 << "\""
+        << ",\"source_model_state_sha256\":"
+        << "\"10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b\""
+        << ",\"source_foundation_lifetime_tokens\":6563072"
+        << ",\"resumed\":" << (resumed ? "true" : "false")
+        << ",\"starting_optimizer_step\":" << startingStep
+        << ",\"ending_optimizer_step\":" << optimizerStep_
+        << ",\"total_updates\":" << stage.totalUpdates
+        << ",\"max_epochs\":" << stage.maxEpochs
+        << ",\"scored_assistant_tokens\":" << scoredThroughRun
+        << ",\"optimizer_init\":\"fresh_zero_moments\""
+        << ",\"baseline\":{\"sft_validation_ce\":"
+        << std::setprecision(17) << baselineSft
+        << ",\"v3_validation_ce\":" << baselineV3
+        << ",\"v1_validation_ce\":" << baselineV1 << "}"
+        << ",\"final\":{\"sft_validation_ce\":" << latestSft
+        << ",\"sft_validation_delta\":" << (latestSft - baselineSft)
+        << ",\"v3_validation_ce\":" << latestV3
+        << ",\"v3_validation_delta\":" << (latestV3 - baselineV3)
+        << ",\"v1_validation_ce\":" << latestV1
+        << ",\"v1_validation_delta\":" << (latestV1 - baselineV1)
+        << ",\"last_train_loss\":";
+    if (std::isfinite(latestTrainLoss)) out << latestTrainLoss;
+    else out << "null";
+    out << ",\"last_global_grad_norm\":";
+    if (std::isfinite(latestGradNorm)) out << latestGradNorm;
+    else out << "null";
+    out << "}"
+        << ",\"session_wall_seconds\":" << sessionSeconds
+        << ",\"session_context_positions_per_second\":" << contextTps
+        << ",\"session_scored_assistant_tokens_per_second\":" << scoredTps
+        << ",\"checkpoint\":{\"path\":\"" << jsonEscape(checkpointPath)
+        << "\",\"bytes\":" << latestCheckpointBytes << "}"
+        << ",\"progress_path\":\"" << jsonEscape(progressPath) << "\""
+        << ",\"production_lr_locked\":true"
+        << ",\"test_split_used\":false"
+        << ",\"pass\":" << (pass ? "true" : "false") << "}";
+
+    const std::string resultJson = out.str();
+    writeProgress(pass);
+    if (pass) {
+        atomicWrite(completedPath, resultJson.data(), resultJson.size());
+        mark("native:f2_sft:complete");
+    } else {
+        mark("native:f2_sft:fail");
+    }
+    return NativeStageResult{pass, resultJson};
+}
+
 NativeStageResult NativeTrainer::runStage(const StagePackageData& stage) {
     mark("native:production:initialize:start");
     initializeSlots();
@@ -4463,6 +5006,37 @@ NativePilotResult runNativeModel0001SftLrPilot(
     }
     completed = true;
     return cached;
+}
+
+
+
+NativeStageResult runNativeModel0001SftStage(
+    const Bundle& bundle,
+    const std::string& stageRoot,
+    const std::string& workDir) {
+    NativeTrainer* trainer = nullptr;
+    try {
+        req(bundle.modelStateSha256 ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+            "F2 SFT production requires promoted Foundation-v3 source bundle");
+        const SftStagePackageData stage = loadSftStagePackage(stageRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        return trainer->runSftStage(stage);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_f2_sft_stage_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(
+                trainer ? trainer->currentStage()
+                        : "native:f2_sft:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":true"
+            << ",\"test_split_used\":false,\"pass\":false}";
+        return NativeStageResult{false, out.str()};
+    }
 }
 
 

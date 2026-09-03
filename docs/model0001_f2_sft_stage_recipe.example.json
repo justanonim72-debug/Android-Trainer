@@ -1,0 +1,32 @@
+{
+  "schema": "model0001_f2_sft_stage_recipe_v1",
+  "source_model_state_sha256": "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+  "stage_name": "friend_f2_sft",
+  "objective": "assistant_content_only_cross_entropy",
+  "source_foundation_lifetime_tokens": 6563072,
+  "total_updates": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+  "max_epochs": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+  "optimizer_init": "fresh_zero_moments",
+  "optimizer": {
+    "name": "AdamW",
+    "betas": [0.9, 0.95],
+    "eps": 1e-8,
+    "grad_clip": 1.0
+  },
+  "lr_schedule": {
+    "type": "linear_warmup_cosine",
+    "peak_lr": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+    "min_lr": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+    "warmup_steps": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT"
+  },
+  "sample_order": {
+    "type": "sequential_masked_windows",
+    "seed": 20260903
+  },
+  "checkpoint_every": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+  "eval_every": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+  "log_every": "LOCK_AFTER_PHYSICAL_F2_LR_PILOT",
+  "eval_windows_per_set": 64,
+  "eval_seed": 20260903,
+  "test_split_used": false
+}
