@@ -164,57 +164,93 @@ def tool_call(name,args):
     )+"</tool_call>"
 
 def deterministic_protocol_records(target_count:int):
-    """Bounded verifier-friendly protocol records; no LLM teacher outputs."""
+    """Bounded verifier-friendly protocol records; no LLM teacher outputs.
+
+    Every emitted conversation is content-unique. We intentionally avoid the
+    old ID-only cycling trick because the source-level deduper correctly
+    removed those exact message duplicates, shrinking protocol supervision.
+    """
     candidates=[]
 
+    memory_templates={
+      "store":[
+        "Ingat ya, {label} gue {value}.",
+        "Catet dong, {label} gue itu {value}.",
+        "Biar nggak lupa, {label} gue {value}.",
+        "Simpan ini ya: {label} gue {value}.",
+      ],
+      "update":[
+        "Update ya, {label} gue sekarang {value}.",
+        "Yang soal {label}, ganti jadi {value}.",
+        "Revisi deh, {label} gue sekarang {value}.",
+        "Sekarang {label} gue {value}, bukan yang lama.",
+      ],
+      "forget":[
+        "Lupain info soal {label} gue.",
+        "Hapus ingatan soal {label} gue.",
+        "Jangan simpan lagi info {label} gue.",
+        "Buang info lama soal {label} gue ya.",
+      ],
+      "lookup":[
+        "Eh, {label} gue apa ya?",
+        "Masih inget {label} gue?",
+        "Coba inget, {label} gue apa?",
+        "Yang lu simpan soal {label} gue apa?",
+      ],
+    }
+    memory_replies={
+      "store":["Oke, gue inget.","Sip, gue simpan.","Oke, kecatet.","Siap, gue inget."],
+      "update":["Sip, udah gue update.","Oke, gue ganti.","Berubah, udah gue update.","Siap, yang lama gue ganti."],
+      "forget":["Oke, udah gue hapus dari ingatan.","Sip, gue lupain.","Oke, info itu gue hapus.","Siap, nggak gue simpan lagi."],
+    }
     preference_values=[
-      ("preference.drink","kopi tanpa gula","minuman favorit"),
-      ("preference.food","mie ayam","makanan favorit"),
-      ("preference.music","lofi","musik yang disukai"),
-      ("preference.study_time","pagi","waktu belajar"),
-      ("preference.reply_style","singkat dan santai","gaya balasan"),
-      ("preference.exercise","jalan pagi","kebiasaan olahraga"),
-      ("preference.snack","pisang goreng","camilan favorit"),
-      ("preference.theme","mode gelap","tema aplikasi"),
-      ("preference.language","Indonesia santai","gaya bahasa"),
-      ("preference.focus","matematika","fokus belajar"),
+      ("preference.drink","kopi tanpa gula","teh tawar","minuman favorit"),
+      ("preference.food","mie ayam","nasi goreng","makanan favorit"),
+      ("preference.music","lofi","jazz","musik yang disukai"),
+      ("preference.study_time","pagi","malam","waktu belajar"),
+      ("preference.reply_style","singkat dan santai","langsung ke inti","gaya balasan"),
+      ("preference.exercise","jalan pagi","lari sore","kebiasaan olahraga"),
+      ("preference.snack","pisang goreng","roti bakar","camilan favorit"),
+      ("preference.theme","mode gelap","mode terang","tema aplikasi"),
+      ("preference.language","Indonesia santai","campur Indo-English","gaya bahasa"),
+      ("preference.focus","matematika","coding","fokus belajar"),
     ]
-    alternatives=[
-      "teh tawar","nasi goreng","jazz","malam","langsung ke inti",
-      "lari sore","roti bakar","mode terang","campur Indo-English","coding"
-    ]
-    for i,(key,value,label) in enumerate(preference_values):
-        pairs=[
-          ("store",f"Ingat ya, {label} gue {value}.",
-           tool_call("memory_store",{"key":key,"value":value}),
-           "{\"ok\":true}","Oke, gue inget."),
-          ("update",f"Update ya, {label} gue sekarang {alternatives[i]}.",
-           tool_call("memory_update",{"key":key,"value":alternatives[i]}),
-           "{\"ok\":true}","Sip, udah gue update."),
-          ("forget",f"Lupain info soal {label} gue.",
-           tool_call("memory_forget",{"key":key}),
-           "{\"ok\":true}","Oke, udah gue hapus dari ingatan."),
-          ("lookup",f"Eh, {label} gue apa ya?",
-           tool_call("memory_lookup",{"key":key}),
-           json.dumps({"found":True,"value":value},ensure_ascii=False,separators=(",",":")),
-           value+"."),
-        ]
-        for op,u,call,result,reply in pairs:
-            rid=f"protocol:memory-{op}:{i:03d}"
-            candidates.append({
-              "id":rid,"language":"id-ID","style":["tool","memory",op],
-              "messages":[
-                {"role":"user","content":u},
-                {"role":"assistant","content":call},
-                {"role":"tool","content":result},
-                {"role":"assistant","content":reply},
-              ],
-              "source":"project deterministic verified protocol v1",
-              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-              "source_family":"deterministic_protocol"
-            })
+    for i,(key,initial,updated,label) in enumerate(preference_values):
+        for variant in range(4):
+            for op in ("store","update","forget","lookup"):
+                value=updated if op=="update" else initial
+                u=memory_templates[op][variant].format(label=label,value=value)
+                if op=="store":
+                    call=tool_call("memory_store",{"key":key,"value":initial})
+                    result="{\"ok\":true}"
+                    reply=memory_replies[op][variant]
+                elif op=="update":
+                    call=tool_call("memory_update",{"key":key,"value":updated})
+                    result="{\"ok\":true}"
+                    reply=memory_replies[op][variant]
+                elif op=="forget":
+                    call=tool_call("memory_forget",{"key":key})
+                    result="{\"ok\":true}"
+                    reply=memory_replies[op][variant]
+                else:
+                    call=tool_call("memory_lookup",{"key":key})
+                    result=json.dumps({"found":True,"value":initial},ensure_ascii=False,separators=(",",":"))
+                    reply=[initial+".",f"{initial}.",f"Yang gue inget: {initial}.",f"{initial}, itu yang tersimpan."][variant]
+                rid=f"protocol:memory-{op}:{i:03d}:v{variant}"
+                candidates.append({
+                  "id":rid,"language":"id-ID","style":["tool","memory",op],
+                  "messages":[
+                    {"role":"user","content":u},
+                    {"role":"assistant","content":call},
+                    {"role":"tool","content":result},
+                    {"role":"assistant","content":reply},
+                  ],
+                  "source":"project deterministic verified protocol v2",
+                  "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+                  "source_family":"deterministic_protocol"
+                })
 
-    transient=[
+    transient_templates=[
       ("Gue lagi di halte sekarang.","Oke."),
       ("Barusan hujan deres di sini.","Waduh 😭"),
       ("Baterai gue tinggal dikit.","Cas dulu kalau bisa 😭"),
@@ -223,59 +259,69 @@ def deterministic_protocol_records(target_count:int):
       ("Barusan lewat depan minimarket.","Oke."),
       ("Sekarang gue duduk di teras.","Santai dulu."),
       ("Tadi gue salah pencet tombol.","Wkwk gapapa."),
+      ("Gue baru turun dari motor.","Oke."),
+      ("Sekarang lagi antre sebentar.","Sip, santai."),
+      ("Gue lagi di depan rumah.","Oke."),
+      ("Barusan selesai mandi.","Wkwk sip."),
     ]
-    for i,(u,a) in enumerate(transient):
-        rid=f"protocol:no-memory:{i:03d}"
-        candidates.append({
-          "id":rid,"language":"id-ID","style":["memory","do-not-store","short"],
-          "messages":[{"role":"user","content":u},{"role":"assistant","content":a}],
-          "source":"project deterministic verified protocol v1",
-          "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-          "source_family":"deterministic_protocol"
-        })
+    for i,(u,a) in enumerate(transient_templates):
+        for variant,suffix in enumerate(("", " nih.", " aja.")):
+            user=u[:-1]+suffix if u.endswith(".") else u+suffix
+            rid=f"protocol:no-memory:{i:03d}:v{variant}"
+            candidates.append({
+              "id":rid,"language":"id-ID","style":["memory","do-not-store","short"],
+              "messages":[{"role":"user","content":user},{"role":"assistant","content":a}],
+              "source":"project deterministic verified protocol v2",
+              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+              "source_family":"deterministic_protocol"
+            })
 
     titles=["minum obat","meeting","lari","belajar","bayar kos","telepon ibu","backup file","isi bensin"]
     dates=["besok","Senin","Jumat","tanggal 5"]
-    times=["06:00","09:00","19:00","20:00"]
+    times=[("06:00","6 pagi"),("09:00","9 pagi"),("19:00","7 malam"),("20:00","8 malam")]
+    schedule_templates=[
+      "Ingetin gue {title} {date} jam {human_time}.",
+      "Tolong pasang reminder {title} {date} jam {human_time}.",
+    ]
     ordinal=0
     for title in titles:
       for date in dates:
-        for time in times:
-          if ordinal>=64: break
-          human_time=time.replace("06:00","6 pagi").replace("09:00","9 pagi").replace("19:00","7 malam").replace("20:00","8 malam")
-          u=f"Ingetin gue {title} {date} jam {human_time}."
-          rid=f"protocol:schedule:{ordinal:03d}"
-          candidates.append({
-            "id":rid,"language":"id-ID","style":["tool","scheduler"],
-            "messages":[
-              {"role":"user","content":u},
-              {"role":"assistant","content":tool_call("schedule_reminder",{"title":title,"when":f"{date} {time}"})},
-              {"role":"tool","content":"{\"ok\":true}"},
-              {"role":"assistant","content":"Siap, pengingatnya udah dipasang."},
-            ],
-            "source":"project deterministic verified protocol v1",
-            "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-            "source_family":"deterministic_protocol"
-          })
+        for time,human_time in times:
+          for variant,template in enumerate(schedule_templates):
+            u=template.format(title=title,date=date,human_time=human_time)
+            rid=f"protocol:schedule:{ordinal:03d}:v{variant}"
+            candidates.append({
+              "id":rid,"language":"id-ID","style":["tool","scheduler"],
+              "messages":[
+                {"role":"user","content":u},
+                {"role":"assistant","content":tool_call("schedule_reminder",{"title":title,"when":f"{date} {time}"})},
+                {"role":"tool","content":"{\"ok\":true}"},
+                {"role":"assistant","content":["Siap, pengingatnya udah dipasang.","Oke, reminder-nya udah gue pasang."][variant]},
+              ],
+              "source":"project deterministic verified protocol v2",
+              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+              "source_family":"deterministic_protocol"
+            })
           ordinal+=1
-        if ordinal>=64: break
-      if ordinal>=64: break
 
     ambiguous=[
       ("Ingetin gue besok jam 8.","Jam 8 pagi atau malam?"),
       ("Pasang reminder hari Jumat.","Jam berapa hari Jumat?"),
       ("Ingetin gue tanggal 10.","Mau diingetin jam berapa tanggal 10?"),
       ("Besok ingetin gue meeting.","Meeting-nya jam berapa?"),
+      ("Minggu depan ingetin gue bayar.","Hari apa dan jam berapa?"),
+      ("Nanti sore ingetin gue belajar.","Sore jam berapa yang lu mau?"),
     ]
     for i,(u,a) in enumerate(ambiguous):
-        rid=f"protocol:schedule-clarify:{i:03d}"
-        candidates.append({
-          "id":rid,"language":"id-ID","style":["scheduler","clarification"],
-          "messages":[{"role":"user","content":u},{"role":"assistant","content":a}],
-          "source":"project deterministic verified protocol v1",
-          "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-          "source_family":"deterministic_protocol"
-        })
+        for variant,prefix in enumerate(("", "Eh, ")):
+            rid=f"protocol:schedule-clarify:{i:03d}:v{variant}"
+            candidates.append({
+              "id":rid,"language":"id-ID","style":["scheduler","clarification"],
+              "messages":[{"role":"user","content":prefix+u},{"role":"assistant","content":a}],
+              "source":"project deterministic verified protocol v2",
+              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+              "source_family":"deterministic_protocol"
+            })
 
     fresh=[
       ("harga tiket kereta","Jakarta Bandung"),
@@ -286,85 +332,96 @@ def deterministic_protocol_records(target_count:int):
       ("versi Android terbaru",""),
       ("jadwal pertandingan","Indonesia"),
       ("harga bensin","Indonesia"),
+      ("kurs dolar rupiah",""),
+      ("jadwal kereta","Yogyakarta Solo"),
+    ]
+    search_templates=[
+      "{q} gimana?",
+      "Coba cek {q}.",
+      "Cariin {q} dong.",
     ]
     ordinal=0
     for subject,place in fresh:
       for temporal in ("sekarang","hari ini","terbaru"):
         q=" ".join(x for x in (subject,place,temporal) if x).strip()
-        u=q.capitalize()+" gimana?"
-        rid=f"protocol:search:{ordinal:03d}"
-        candidates.append({
-          "id":rid,"language":"id-ID","style":["tool","search","freshness"],
-          "messages":[
-            {"role":"user","content":u},
-            {"role":"assistant","content":tool_call("web_search",{"query":q})},
-            {"role":"tool","content":"{\"results\":[{\"title\":\"Hasil terbaru\",\"snippet\":\"Informasi terbaru tersedia dari sumber.\",\"source\":\"source://example\"}]}"},
-            {"role":"assistant","content":"Ini butuh info terbaru; gue pakai hasil pencarian yang barusan."},
-          ],
-          "source":"project deterministic verified protocol v1",
-          "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-          "source_family":"deterministic_protocol"
-        })
+        for variant,template in enumerate(search_templates):
+            u=template.format(q=q)
+            rid=f"protocol:search:{ordinal:03d}:v{variant}"
+            candidates.append({
+              "id":rid,"language":"id-ID","style":["tool","search","freshness"],
+              "messages":[
+                {"role":"user","content":u},
+                {"role":"assistant","content":tool_call("web_search",{"query":q})},
+                {"role":"tool","content":"{\"results\":[{\"title\":\"Hasil terbaru\",\"snippet\":\"Informasi terbaru tersedia dari sumber.\",\"source\":\"source://example\"}]}"},
+                {"role":"assistant","content":[
+                  "Ini butuh info terbaru; gue pakai hasil pencarian yang barusan.",
+                  "Gue cek info terbarunya dulu, ini hasilnya.",
+                  "Karena ini bisa berubah, gue pakai hasil pencarian terbaru."
+                ][variant]},
+              ],
+              "source":"project deterministic verified protocol v2",
+              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+              "source_family":"deterministic_protocol"
+            })
         ordinal+=1
 
-    privacy_places=["Banda Aceh","Jakarta","Surabaya","Medan"]
+    privacy_places=["Banda Aceh","Jakarta","Surabaya","Medan","Semarang","Bandung"]
     for i,place in enumerate(privacy_places):
-        rid=f"protocol:search-min-private:{i:03d}"
-        candidates.append({
-          "id":rid,"language":"id-ID","style":["tool","search","privacy"],
-          "messages":[
-            {"role":"user","content":f"Gue lagi ada urusan pribadi sama keluarga. Cuaca {place} sekarang gimana?"},
-            {"role":"assistant","content":tool_call("web_search",{"query":f"cuaca {place} sekarang"})},
-            {"role":"tool","content":"{\"results\":[{\"title\":\"Cuaca\",\"snippet\":\"Data cuaca terbaru.\",\"source\":\"source://example\"}]}"},
-            {"role":"assistant","content":"Gue cuma kirim query cuacanya, bukan konteks pribadi lu."},
-          ],
-          "source":"project deterministic verified protocol v1",
-          "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-          "source_family":"deterministic_protocol"
-        })
+        for variant,private_context in enumerate((
+            "Gue lagi ada urusan pribadi sama keluarga.",
+            "Gue lagi di tempat temen dan ada urusan pribadi.",
+            "Ada konteks pribadi yang nggak perlu lu kirim keluar."
+        )):
+            rid=f"protocol:search-min-private:{i:03d}:v{variant}"
+            candidates.append({
+              "id":rid,"language":"id-ID","style":["tool","search","privacy"],
+              "messages":[
+                {"role":"user","content":f"{private_context} Cuaca {place} sekarang gimana?"},
+                {"role":"assistant","content":tool_call("web_search",{"query":f"cuaca {place} sekarang"})},
+                {"role":"tool","content":"{\"results\":[{\"title\":\"Cuaca\",\"snippet\":\"Data cuaca terbaru.\",\"source\":\"source://example\"}]}"},
+                {"role":"assistant","content":"Gue cuma kirim query cuacanya, bukan konteks pribadi lu."},
+              ],
+              "source":"project deterministic verified protocol v2",
+              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+              "source_family":"deterministic_protocol"
+            })
 
-    # Persona/config consistency: variable identity, not one hard-coded persona.
     personas=[
-      ("Nara","santai"),
-      ("Ari","singkat"),
-      ("Mika","ramah"),
-      ("Raka","santai"),
-      ("Luna","ringkas"),
-      ("Dio","casual"),
+      ("Nara","santai"),("Ari","singkat"),("Mika","ramah"),
+      ("Raka","santai"),("Luna","ringkas"),("Dio","casual"),
+      ("Sora","hangat"),("Niko","langsung"),("Alya","ramah"),
+    ]
+    persona_questions=[
+      ("Nama lu siapa?","Masih inget?"),
+      ("Lu dipanggil siapa?","Coba sebut lagi."),
+      ("Nama yang diset buat lu apa?","Belum lupa kan?"),
     ]
     for i,(name,tone) in enumerate(personas):
-        rid=f"protocol:persona:{i:03d}"
-        candidates.append({
-          "id":rid,"language":"id-ID","style":["persona","multi-turn",tone],
-          "messages":[
-            {"role":"system","content":f"Nama kamu {name}. Gaya balasan {tone}. Jangan mengulang deskripsi persona tanpa perlu."},
-            {"role":"user","content":"Nama lu siapa?"},
-            {"role":"assistant","content":f"{name}."},
-            {"role":"user","content":"Masih inget?"},
-            {"role":"assistant","content":f"Iya, {name}."},
-          ],
-          "source":"project deterministic verified protocol v1",
-          "license":"project-authored","quality_score":1.0,"split":split_for(rid),
-          "source_family":"deterministic_protocol"
-        })
+        for variant,(q1,q2) in enumerate(persona_questions):
+            rid=f"protocol:persona:{i:03d}:v{variant}"
+            candidates.append({
+              "id":rid,"language":"id-ID","style":["persona","multi-turn",tone],
+              "messages":[
+                {"role":"system","content":f"Nama kamu {name}. Gaya balasan {tone}. Jangan mengulang deskripsi persona tanpa perlu."},
+                {"role":"user","content":q1},
+                {"role":"assistant","content":f"{name}."},
+                {"role":"user","content":q2},
+                {"role":"assistant","content":f"Iya, {name}."},
+              ],
+              "source":"project deterministic verified protocol v2",
+              "license":"project-authored","quality_score":1.0,"split":split_for(rid),
+              "source_family":"deterministic_protocol"
+            })
 
     candidates.sort(key=lambda r:stable_rank(r["id"]))
     if target_count<=0:
         return []
-    # Cycle only if the human corpus is unexpectedly enormous; every cycle gets
-    # a distinct ID but retains deterministic verifier-friendly semantics.
-    out=[]
-    cycle=0
-    while len(out)<target_count:
-        for base in candidates:
-            if len(out)>=target_count: break
-            row=json.loads(json.dumps(base,ensure_ascii=False))
-            if cycle:
-                row["id"]=f"{base['id']}:v{cycle}"
-                row["split"]=split_for(row["id"])
-            out.append(row)
-        cycle+=1
-    return out
+    if target_count>len(candidates):
+        raise SystemExit(
+            f"STOP: requested {target_count} protocol records but only "
+            f"{len(candidates)} content-unique verified candidates exist"
+        )
+    return candidates[:target_count]
 
 def validate_record(row):
     if row["split"] not in ("train","validation"): return False
@@ -379,8 +436,8 @@ def validate_record(row):
     )
 
 def runtime_smoke_test():
-    rows=deterministic_protocol_records(32)
-    if len(rows)!=32:
+    rows=deterministic_protocol_records(500)
+    if len(rows)!=500:
         raise SystemExit("STOP: F2 deterministic protocol smoke count mismatch")
     ids=[r["id"] for r in rows]
     if len(ids)!=len(set(ids)):
@@ -430,8 +487,11 @@ def main():
     human_count=len(records)
     if human_count<=0:
         raise SystemExit("STOP: no human F2 dialogue records")
-    # ~10% of final records, capped so protocol templates cannot dominate.
-    protocol_target=max(64,min(1200,int(round(human_count/9.0))))
+    # Target ~5% protocol records. These records contain tool-call + visible
+    # assistant outputs and therefore contribute roughly twice the scored
+    # assistant tokens per record of ordinary dialogue. The packer enforces the
+    # actual scored-token fraction at 8-15%.
+    protocol_target=max(96,min(600,int(round(human_count/20.0))))
     records.extend(deterministic_protocol_records(protocol_target))
 
     seen=set(); clean=[]
@@ -451,7 +511,7 @@ def main():
     if family["human_natural_dialogue"]==0 or family["human_task_dialogue"]==0:
         raise SystemExit("STOP: human dialogue families missing")
     protocol_share=family["deterministic_protocol"]/max(1,len(clean))
-    if protocol_share>0.13:
+    if protocol_share>0.08:
         raise SystemExit(f"STOP: deterministic protocol source dominance {protocol_share:.4f}")
 
     outdir=project/"data"/"f2_sft"
