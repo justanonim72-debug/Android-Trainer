@@ -196,6 +196,18 @@ def main():
     if val["scored_target_tokens"]<256:
         raise SystemExit("STOP: F2 validation has too few scored tokens")
 
+    train_protocol_scored = train["scored_tokens_by_family"].get(
+        "deterministic_protocol", 0
+    )
+    train_protocol_fraction = (
+        train_protocol_scored / train["scored_target_tokens"]
+    )
+    if not (0.08 <= train_protocol_fraction <= 0.15):
+        raise SystemExit(
+            "STOP: F2 deterministic protocol scored-token fraction "
+            f"{train_protocol_fraction:.6f} outside locked 0.08..0.15"
+        )
+
     report={
       "status":"PASS",
       "schema":"model0001_f2_sft_pack_report_v1",
@@ -206,6 +218,8 @@ def main():
       "source_validator_audit_sha256":sha256(source_audit),
       "tokenizer_sha256":TOKENIZER_SHA,
       "context_tokens":SEQ,
+      "train_deterministic_protocol_scored_fraction":train_protocol_fraction,
+      "locked_protocol_scored_fraction_range":[0.08,0.15],
       "role_prefixes":ROLE_PREFIX,
       "train":train,
       "validation":val,
