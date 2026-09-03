@@ -617,34 +617,44 @@ __kernel void silu_multiply_backward(
 __kernel void cross_entropy_forward_backward(
     __global const float* logits,
     __global const int* targets,
+    __global const int* lossMask,
     __global float* rowLoss,
     __global float* dlogits,
     int rows,
-    int vocab) {
+    int vocab,
+    int activeRows) {
     int row = (int)get_global_id(0);
     if (row >= rows) return;
     int base = row * vocab;
+    int active = lossMask[row] != 0;
+    if (!active) {
+        rowLoss[row] = 0.0f;
+        for (int j = 0; j < vocab; ++j) dlogits[base + j] = 0.0f;
+        return;
+    }
     float mx = -3.402823466e+38F;
     for (int j = 0; j < vocab; ++j) mx = fmax(mx, logits[base + j]);
     float den = 0.0f;
     for (int j = 0; j < vocab; ++j) den += exp(logits[base + j] - mx);
     rowLoss[row] = -(logits[base + targets[row]] - mx - log(den));
     float inv = 1.0f / den;
-    float mean = 1.0f / (float)rows;
+    float mean = 1.0f / (float)activeRows;
     for (int j = 0; j < vocab; ++j) {
         float p = exp(logits[base + j] - mx) * inv;
-        dlogits[base + j] = (p - (j == targets[row] ? 1.0f : 0.0f)) * mean;
+        dlogits[base + j] =
+            (p - (j == targets[row] ? 1.0f : 0.0f)) * mean;
     }
 }
 
 __kernel void mean_rows(
     __global const float* rows,
     __global float* out,
-    int n) {
+    int n,
+    int activeRows) {
     if (get_global_id(0) != 0) return;
     float acc = 0.0f;
     for (int i = 0; i < n; ++i) acc += rows[i];
-    out[0] = acc / (float)n;
+    out[0] = acc / (float)activeRows;
 }
 
 __kernel void embedding_add(
@@ -1385,6 +1395,178 @@ PilotPackageData loadPilotPackage(const std::string& root) {
 }
 
 
+struct SftWindowDataFile {
+    std::string tokensRelativePath;
+    std::string maskRelativePath;
+    std::vector<uint16_t> tokens;
+    std::vector<uint8_t> masks;
+    int windows = 0;
+};
+
+struct SftPilotPackageData {
+    std::vector<double> lrCandidates;
+    std::vector<int> trainIndices;
+    std::vector<int> sftEvalIndices;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+    int trainSteps = 0;
+    int warmupSteps = 0;
+    SftWindowDataFile train;
+    SftWindowDataFile sftValidation;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+};
+
+SftWindowDataFile loadSftWindowDataFile(
+    const std::string& root, const rapidjson::Value& data,
+    const char* key) {
+    req(data.HasMember(key) && data[key].IsObject(),
+        std::string("SFT pilot data manifest missing: ") + key);
+    const auto& spec = data[key];
+    req(spec.HasMember("tokens_path") && spec["tokens_path"].IsString() &&
+            spec.HasMember("mask_path") && spec["mask_path"].IsString() &&
+            spec.HasMember("windows") && spec["windows"].IsInt() &&
+            spec.HasMember("tokens_per_window") &&
+            spec["tokens_per_window"].IsInt() &&
+            spec["tokens_per_window"].GetInt() == S + 1 &&
+            spec.HasMember("mask_targets_per_window") &&
+            spec["mask_targets_per_window"].IsInt() &&
+            spec["mask_targets_per_window"].GetInt() == S,
+        std::string("invalid SFT window data spec: ") + key);
+
+    SftWindowDataFile file;
+    file.tokensRelativePath = spec["tokens_path"].GetString();
+    file.maskRelativePath = spec["mask_path"].GetString();
+    file.windows = spec["windows"].GetInt();
+    req(file.windows > 0, "SFT pilot data has zero windows");
+
+    file.tokens = readU16LeFile(
+        safePilotPath(root, file.tokensRelativePath));
+    const auto maskBytes = readBinaryFile(
+        safePilotPath(root, file.maskRelativePath));
+    file.masks.assign(maskBytes.begin(), maskBytes.end());
+
+    req(file.tokens.size() ==
+            static_cast<size_t>(file.windows) * (S + 1),
+        "SFT token-window count mismatch");
+    req(file.masks.size() ==
+            static_cast<size_t>(file.windows) * S,
+        "SFT mask-window count mismatch");
+    for (uint8_t value : file.masks) {
+        req(value == 0 || value == 1,
+            "SFT loss mask must be binary");
+    }
+    return file;
+}
+
+SftPilotPackageData loadSftPilotPackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid SFT pilot manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_f2_sft_lr_pilot_v1",
+        "unsupported SFT pilot schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "SFT pilot source model SHA mismatch");
+    req(doc.HasMember("objective") && doc["objective"].IsString() &&
+            std::string(doc["objective"].GetString()) ==
+                "assistant_content_only_cross_entropy",
+        "SFT pilot objective drift");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "SFT pilot hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("assistant_only_loss") &&
+            guards["assistant_only_loss"].IsBool() &&
+            guards["assistant_only_loss"].GetBool(),
+        "SFT pilot assistant-only guard missing");
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "SFT pilot package contains test split");
+    req(guards.HasMember("dataset_v2_train_bin_packaged") &&
+            guards["dataset_v2_train_bin_packaged"].IsBool() &&
+            !guards["dataset_v2_train_bin_packaged"].GetBool(),
+        "SFT pilot package contains Dataset-v2 train");
+    req(guards.HasMember("foundation_v3_train_bin_packaged") &&
+            guards["foundation_v3_train_bin_packaged"].IsBool() &&
+            !guards["foundation_v3_train_bin_packaged"].GetBool(),
+        "SFT pilot package contains Foundation-v3 train");
+
+    req(doc.HasMember("protocol") && doc["protocol"].IsObject(),
+        "SFT pilot protocol missing");
+    const auto& protocol = doc["protocol"];
+    req(protocol.HasMember("train_steps_per_candidate") &&
+            protocol["train_steps_per_candidate"].IsInt() &&
+            protocol.HasMember("warmup_steps") &&
+            protocol["warmup_steps"].IsInt() &&
+            protocol.HasMember("lr_candidates") &&
+            protocol["lr_candidates"].IsArray(),
+        "SFT pilot protocol malformed");
+
+    SftPilotPackageData result;
+    result.trainSteps = protocol["train_steps_per_candidate"].GetInt();
+    result.warmupSteps = protocol["warmup_steps"].GetInt();
+    req(result.trainSteps == 96 && result.warmupSteps == 3,
+        "SFT pilot step/warmup contract drift");
+    for (const auto& value : protocol["lr_candidates"].GetArray()) {
+        req(value.IsNumber(), "SFT pilot LR candidate is not numeric");
+        const double lr = value.GetDouble();
+        req(std::isfinite(lr) && lr >= 1.0e-5 && lr <= 5.0e-5,
+            "SFT pilot LR outside locked full-SFT range");
+        result.lrCandidates.push_back(lr);
+    }
+    req(result.lrCandidates.size() == 3,
+        "SFT pilot must contain exactly three LR candidates");
+
+    req(doc.HasMember("indices") && doc["indices"].IsObject(),
+        "SFT pilot indices missing");
+    const auto& indices = doc["indices"];
+    result.trainIndices = readIndexArray(indices, "train");
+    result.sftEvalIndices = readIndexArray(indices, "sft_validation");
+    result.v3EvalIndices = readIndexArray(indices, "v3_validation");
+    result.v1EvalIndices = readIndexArray(indices, "v1_validation");
+    req(static_cast<int>(result.trainIndices.size()) == result.trainSteps,
+        "SFT pilot train index count mismatch");
+    req(result.sftEvalIndices.size() == 24 &&
+            result.v3EvalIndices.size() == 24 &&
+            result.v1EvalIndices.size() == 24,
+        "SFT pilot eval-window count drift");
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "SFT pilot data section missing");
+    const auto& data = doc["data"];
+    result.train = loadSftWindowDataFile(root, data, "sft_train");
+    result.sftValidation =
+        loadSftWindowDataFile(root, data, "sft_validation");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("SFT pilot index outside ") + label);
+        }
+    };
+    validateIndices(result.trainIndices, result.train.windows, "SFT train");
+    validateIndices(
+        result.sftEvalIndices, result.sftValidation.windows, "SFT validation");
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows, "V3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows, "V1 validation");
+    return result;
+}
+
+
 struct StagePackageData {
     std::string recipeSha256;
     std::string stageName;
@@ -1620,6 +1802,7 @@ public:
 
     NativeGateResult run(const std::function<double()>& cpuBaseline);
     NativePilotResult runPilot(const PilotPackageData& pilot);
+    NativePilotResult runSftPilot(const SftPilotPackageData& pilot);
     NativeStageResult runStage(const StagePackageData& stage);
     const std::string& currentStage() const { return currentStage_; }
 
@@ -1641,6 +1824,8 @@ private:
 
     cl_mem tokens_ = nullptr;
     cl_mem targets_ = nullptr;
+    cl_mem lossMask_ = nullptr;
+    int activeLossRows_ = S;
     cl_mem ropeCos_ = nullptr;
     cl_mem ropeSin_ = nullptr;
     cl_mem uniqueTokenIds_ = nullptr;
@@ -1733,6 +1918,8 @@ private:
     void resetToSourceState();
     void initializeInputs();
     void setTrainingWindow(const int32_t* tokens257);
+    void setTrainingWindowMasked(
+        const int32_t* tokens257, const int32_t* lossMask256);
     void setLearningRate(float lr);
     void initializeActivations();
     void wireLayers();
@@ -1771,8 +1958,12 @@ private:
     float readLoss();
     float readGlobalNorm();
     void setWindowFromU16(const PilotDataFile& data, int windowIndex);
+    int setWindowFromSft(
+        const SftWindowDataFile& data, int windowIndex);
     double evaluateCe(
         const PilotDataFile& data, const std::vector<int>& indices);
+    double evaluateSftCe(
+        const SftWindowDataFile& data, const std::vector<int>& indices);
 
     std::vector<float> gather(cl_mem source, const std::vector<int>& indices);
     ForwardGate checkForward();
@@ -1897,6 +2088,7 @@ void NativeTrainer::wireLayers() {
 void NativeTrainer::initializeInputs() {
     tokens_ = runtime_.allocate(S * sizeof(int32_t));
     targets_ = runtime_.allocate(S * sizeof(int32_t));
+    lossMask_ = runtime_.allocate(S * sizeof(int32_t));
 
     std::vector<float> cosines(S * HD), sines(S * HD);
     for (int position = 0; position < S; ++position) {
@@ -1929,13 +2121,31 @@ void NativeTrainer::initializeInputs() {
 }
 
 void NativeTrainer::setTrainingWindow(const int32_t* tokens257) {
+    std::array<int32_t, S> fullMask{};
+    fullMask.fill(1);
+    setTrainingWindowMasked(tokens257, fullMask.data());
+}
+
+void NativeTrainer::setTrainingWindowMasked(
+    const int32_t* tokens257, const int32_t* lossMask256) {
     req(tokens257 != nullptr, "null training window");
+    req(lossMask256 != nullptr, "null training loss mask");
+    int active = 0;
     for (int i = 0; i <= S; ++i) {
         req(tokens257[i] >= 0 && tokens257[i] < V,
             "training window token out of vocabulary");
+        if (i < S) {
+            req(lossMask256[i] == 0 || lossMask256[i] == 1,
+                "training loss mask must be binary");
+            active += lossMask256[i];
+        }
     }
+    req(active > 0 && active <= S,
+        "training loss mask must score at least one target");
+    activeLossRows_ = active;
     runtime_.write(tokens_, tokens257, S * sizeof(int32_t));
     runtime_.write(targets_, tokens257 + 1, S * sizeof(int32_t));
+    runtime_.write(lossMask_, lossMask256, S * sizeof(int32_t));
 
     std::map<int32_t, std::vector<int32_t>> byToken;
     for (int position = 0; position < S; ++position) {
@@ -2353,15 +2563,18 @@ void NativeTrainer::forward() {
     const int vocab = V;
     runtime_.argument(ce, 0, logits_);
     runtime_.argument(ce, 1, targets_);
-    runtime_.argument(ce, 2, rowLoss_);
-    runtime_.argument(ce, 3, dLogits_);
-    runtime_.argument(ce, 4, rows);
-    runtime_.argument(ce, 5, vocab);
+    runtime_.argument(ce, 2, lossMask_);
+    runtime_.argument(ce, 3, rowLoss_);
+    runtime_.argument(ce, 4, dLogits_);
+    runtime_.argument(ce, 5, rows);
+    runtime_.argument(ce, 6, vocab);
+    runtime_.argument(ce, 7, activeLossRows_);
     runtime_.enqueue1(ce, rows);
     cl_kernel mean = runtime_.kernel("mean_rows");
     runtime_.argument(mean, 0, rowLoss_);
     runtime_.argument(mean, 1, loss_);
     runtime_.argument(mean, 2, rows);
+    runtime_.argument(mean, 3, activeLossRows_);
     runtime_.enqueue1(mean, 1, 1);
 }
 
@@ -2594,6 +2807,43 @@ void NativeTrainer::setWindowFromU16(
     setTrainingWindow(window.data());
 }
 
+int NativeTrainer::setWindowFromSft(
+    const SftWindowDataFile& data, int windowIndex) {
+    req(windowIndex >= 0 && windowIndex < data.windows,
+        "SFT window index out of range");
+    const size_t tokenOffset =
+        static_cast<size_t>(windowIndex) * (S + 1);
+    const size_t maskOffset =
+        static_cast<size_t>(windowIndex) * S;
+    req(tokenOffset + S < data.tokens.size(),
+        "SFT token window exceeds file");
+    req(maskOffset + S <= data.masks.size(),
+        "SFT mask window exceeds file");
+
+    std::array<int32_t, S + 1> window{};
+    std::array<int32_t, S> mask{};
+    int active = 0;
+    for (int i = 0; i <= S; ++i) {
+        window[static_cast<size_t>(i)] =
+            static_cast<int32_t>(
+                data.tokens[tokenOffset + static_cast<size_t>(i)]);
+        if (i < S) {
+            const int value = static_cast<int>(
+                data.masks[maskOffset + static_cast<size_t>(i)]);
+            req(value == 0 || value == 1,
+                "SFT window mask must be binary");
+            mask[static_cast<size_t>(i)] = value;
+            active += value;
+        }
+    }
+    req(active > 0 && active <= S,
+        "SFT window has no scored assistant targets");
+    setTrainingWindowMasked(window.data(), mask.data());
+    req(activeLossRows_ == active,
+        "SFT active target count drift");
+    return active;
+}
+
 double NativeTrainer::evaluateCe(
     const PilotDataFile& data, const std::vector<int>& indices) {
     req(!indices.empty(), "empty pilot eval index set");
@@ -2607,6 +2857,27 @@ double NativeTrainer::evaluateCe(
     const double mean = static_cast<double>(
         total / static_cast<long double>(indices.size()));
     req(std::isfinite(mean), "nonfinite pilot validation CE");
+    return mean;
+}
+
+double NativeTrainer::evaluateSftCe(
+    const SftWindowDataFile& data, const std::vector<int>& indices) {
+    req(!indices.empty(), "empty SFT pilot eval index set");
+    long double weighted = 0.0;
+    uint64_t activeTargets = 0;
+    for (int index : indices) {
+        const int active = setWindowFromSft(data, index);
+        forward();
+        weighted +=
+            static_cast<long double>(readLoss()) *
+            static_cast<long double>(active);
+        activeTargets += static_cast<uint64_t>(active);
+    }
+    runtime_.finish();
+    req(activeTargets > 0, "SFT pilot eval has zero active targets");
+    const double mean = static_cast<double>(
+        weighted / static_cast<long double>(activeTargets));
+    req(std::isfinite(mean), "nonfinite SFT pilot validation CE");
     return mean;
 }
 
@@ -3402,6 +3673,193 @@ NativePilotResult NativeTrainer::runPilot(const PilotPackageData& pilot) {
 }
 
 
+NativePilotResult NativeTrainer::runSftPilot(
+    const SftPilotPackageData& pilot) {
+    mark("native:sft_pilot:initialize:start");
+    req(bundle_.modelStateSha256 ==
+            "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "SFT pilot requires promoted Foundation-v3 source bundle");
+
+    initializeSlots();
+    initializeInputs();
+    initializeActivations();
+
+    const ProbeError weightError = validateWeightLoad();
+    req(std::isfinite(weightError.maxAbs) && weightError.maxAbs == 0.0,
+        "SFT pilot source weight-load verification failed");
+
+    mark("native:sft_pilot:baseline:start");
+    resetToSourceState();
+    const double baselineSft =
+        evaluateSftCe(pilot.sftValidation, pilot.sftEvalIndices);
+    const double baselineV3 =
+        evaluateCe(pilot.v3Validation, pilot.v3EvalIndices);
+    const double baselineV1 =
+        evaluateCe(pilot.v1Validation, pilot.v1EvalIndices);
+    mark("native:sft_pilot:baseline:done");
+
+    struct Candidate {
+        double lr = 0.0;
+        bool pass = false;
+        double seconds = 0.0;
+        double updateTokensPerSecond = 0.0;
+        double scoredTokensPerSecond = 0.0;
+        uint64_t scoredTrainTokens = 0;
+        double firstLossMean = 0.0;
+        double lastLossMean = 0.0;
+        double finalTrainLoss = 0.0;
+        double maxGradNorm = 0.0;
+        double finalSft = 0.0;
+        double finalV3 = 0.0;
+        double finalV1 = 0.0;
+    };
+
+    std::vector<Candidate> results;
+    results.reserve(pilot.lrCandidates.size());
+
+    for (size_t candidateIndex = 0;
+         candidateIndex < pilot.lrCandidates.size(); ++candidateIndex) {
+        const double candidateLr = pilot.lrCandidates[candidateIndex];
+        mark("native:sft_pilot:candidate:" +
+             std::to_string(candidateIndex) + ":reset");
+        resetToSourceState();
+        req(optimizerStep_ == 0,
+            "SFT pilot candidate did not start at step zero");
+
+        std::vector<double> losses;
+        losses.reserve(static_cast<size_t>(pilot.trainSteps));
+        double maxNorm = 0.0;
+        uint64_t scoredTokens = 0;
+
+        mark("native:sft_pilot:candidate:" +
+             std::to_string(candidateIndex) + ":train");
+        const auto started = std::chrono::steady_clock::now();
+        for (int step = 0; step < pilot.trainSteps; ++step) {
+            const int active =
+                setWindowFromSft(pilot.train, pilot.trainIndices[step]);
+            scoredTokens += static_cast<uint64_t>(active);
+            const int warmNumerator =
+                std::min(step + 1, pilot.warmupSteps);
+            const float lr = static_cast<float>(
+                candidateLr *
+                static_cast<double>(warmNumerator) /
+                static_cast<double>(pilot.warmupSteps));
+            setLearningRate(lr);
+            fullTrainingStep();
+            losses.push_back(static_cast<double>(readLoss()));
+            maxNorm = std::max(
+                maxNorm, static_cast<double>(readGlobalNorm()));
+        }
+        runtime_.finish();
+        const auto stopped = std::chrono::steady_clock::now();
+
+        req(optimizerStep_ == static_cast<uint64_t>(pilot.trainSteps),
+            "SFT pilot optimizer-step count mismatch");
+        req(!losses.empty(), "SFT pilot candidate produced no losses");
+        req(scoredTokens > 0, "SFT pilot candidate scored zero assistant tokens");
+
+        const int edge = std::min<int>(12, losses.size());
+        long double first = 0.0, last = 0.0;
+        for (int i = 0; i < edge; ++i) {
+            first += losses[static_cast<size_t>(i)];
+            last += losses[losses.size() - edge + static_cast<size_t>(i)];
+        }
+
+        Candidate result;
+        result.lr = candidateLr;
+        result.seconds = std::chrono::duration<double>(
+            stopped - started).count();
+        result.updateTokensPerSecond =
+            static_cast<double>(pilot.trainSteps) * S /
+            std::max(result.seconds, 1.0e-9);
+        result.scoredTokensPerSecond =
+            static_cast<double>(scoredTokens) /
+            std::max(result.seconds, 1.0e-9);
+        result.scoredTrainTokens = scoredTokens;
+        result.firstLossMean =
+            static_cast<double>(first / static_cast<long double>(edge));
+        result.lastLossMean =
+            static_cast<double>(last / static_cast<long double>(edge));
+        result.finalTrainLoss = losses.back();
+        result.maxGradNorm = maxNorm;
+
+        mark("native:sft_pilot:candidate:" +
+             std::to_string(candidateIndex) + ":evaluate");
+        result.finalSft =
+            evaluateSftCe(pilot.sftValidation, pilot.sftEvalIndices);
+        result.finalV3 =
+            evaluateCe(pilot.v3Validation, pilot.v3EvalIndices);
+        result.finalV1 =
+            evaluateCe(pilot.v1Validation, pilot.v1EvalIndices);
+        result.pass =
+            std::isfinite(result.firstLossMean) &&
+            std::isfinite(result.lastLossMean) &&
+            std::isfinite(result.finalTrainLoss) &&
+            std::isfinite(result.maxGradNorm) &&
+            std::isfinite(result.finalSft) &&
+            std::isfinite(result.finalV3) &&
+            std::isfinite(result.finalV1) &&
+            result.updateTokensPerSecond > 0.0 &&
+            result.scoredTokensPerSecond > 0.0;
+        results.push_back(result);
+    }
+
+    bool allPass = !results.empty();
+    for (const auto& value : results) allPass = allPass && value.pass;
+
+    std::ostringstream out;
+    out << "{\"status\":\"" << (allPass ? "PASS" : "FAIL")
+        << "\",\"schema\":\"model0001_f2_sft_lr_pilot_report_v1\""
+        << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+        << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT) << "\""
+        << ",\"source_model_state_sha256\":"
+        << "\"10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b\""
+        << ",\"objective\":\"assistant_content_only_cross_entropy\""
+        << ",\"fresh_zero_moments_each_candidate\":true"
+        << ",\"train_steps_per_candidate\":" << pilot.trainSteps
+        << ",\"warmup_steps\":" << pilot.warmupSteps
+        << ",\"context_target_positions_per_update\":" << S
+        << ",\"baseline\":{\"sft_validation_ce\":"
+        << std::setprecision(17) << baselineSft
+        << ",\"v3_validation_ce\":" << baselineV3
+        << ",\"v1_validation_ce\":" << baselineV1 << "}"
+        << ",\"candidates\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) out << ",";
+        const auto& value = results[i];
+        out << "{\"lr\":" << std::setprecision(17) << value.lr
+            << ",\"pass\":" << (value.pass ? "true" : "false")
+            << ",\"seconds\":" << value.seconds
+            << ",\"context_target_positions_per_second\":"
+            << value.updateTokensPerSecond
+            << ",\"scored_assistant_tokens\":" << value.scoredTrainTokens
+            << ",\"scored_assistant_tokens_per_second\":"
+            << value.scoredTokensPerSecond
+            << ",\"first_12_train_loss_mean\":" << value.firstLossMean
+            << ",\"last_12_train_loss_mean\":" << value.lastLossMean
+            << ",\"final_train_loss\":" << value.finalTrainLoss
+            << ",\"max_global_grad_norm\":" << value.maxGradNorm
+            << ",\"sft_validation_ce\":" << value.finalSft
+            << ",\"sft_validation_delta\":"
+            << (value.finalSft - baselineSft)
+            << ",\"v3_validation_ce\":" << value.finalV3
+            << ",\"v3_validation_delta\":"
+            << (value.finalV3 - baselineV3)
+            << ",\"v1_validation_ce\":" << value.finalV1
+            << ",\"v1_validation_delta\":"
+            << (value.finalV1 - baselineV1)
+            << "}";
+    }
+    out << "]"
+        << ",\"production_lr_locked\":false"
+        << ",\"test_split_used\":false"
+        << ",\"pass\":" << (allPass ? "true" : "false") << "}";
+
+    mark(allPass ? "native:sft_pilot:pass" : "native:sft_pilot:fail");
+    return NativePilotResult{allPass, out.str()};
+}
+
+
 NativeStageResult NativeTrainer::runStage(const StagePackageData& stage) {
     mark("native:production:initialize:start");
     initializeSlots();
@@ -3962,6 +4420,42 @@ NativePilotResult runNativeModel0001LrPilot(
             << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
             << "\",\"first_failing_stage\":\""
             << jsonEscape(trainer ? trainer->currentStage() : "native:pilot:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":false"
+            << ",\"test_split_used\":false,\"pass\":false}";
+        cached = {false, out.str()};
+    }
+    completed = true;
+    return cached;
+}
+
+
+
+NativePilotResult runNativeModel0001SftLrPilot(
+    const Bundle& bundle,
+    const std::string& pilotRoot,
+    const std::string& workDir) {
+    static bool completed = false;
+    static NativePilotResult cached;
+    if (completed) return cached;
+    NativeTrainer* trainer = nullptr;
+    try {
+        req(bundle.modelStateSha256 ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+            "F2 SFT pilot requires promoted Foundation-v3 source bundle");
+        const SftPilotPackageData pilot = loadSftPilotPackage(pilotRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        cached = trainer->runSftPilot(pilot);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_f2_sft_lr_pilot_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(
+                trainer ? trainer->currentStage()
+                        : "native:sft_pilot:initialize")
             << "\",\"error\":\"" << jsonEscape(error.what())
             << "\",\"production_lr_locked\":false"
             << ",\"test_split_used\":false,\"pass\":false}";

@@ -33,6 +33,11 @@ NativePilotResult runNativeModel0001LrPilot(
     const std::string& pilotRoot,
     const std::string& workDir);
 
+NativePilotResult runNativeModel0001SftLrPilot(
+    const Bundle& bundle,
+    const std::string& pilotRoot,
+    const std::string& workDir);
+
 struct NativeStageResult {
     bool pass = false;
     std::string json;
