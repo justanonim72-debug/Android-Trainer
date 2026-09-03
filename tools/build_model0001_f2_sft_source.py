@@ -56,8 +56,12 @@ def norm_text(s:str)->str:
 def text_sha(s:str)->str:
     return hashlib.sha256(norm_text(s).encode("utf-8")).hexdigest()
 
+def stable_rank(rid:str)->str:
+    """Deterministic ordering key independent of Python hash randomization."""
+    return hashlib.sha256((SEED+":"+rid).encode("utf-8")).hexdigest()
+
 def split_for(rid:str)->str:
-    h=int(hashlib.sha256((SEED+":"+rid).encode()).hexdigest()[:16],16)
+    h=int(stable_rank(rid)[:16],16)
     return "validation" if h%VALIDATION_BUCKETS==0 else "train"
 
 def looks_codeswitch(messages)->bool:
