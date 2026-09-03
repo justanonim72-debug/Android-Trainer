@@ -1248,7 +1248,11 @@ public final class MainActivity extends Activity {
     private void runF2SftLrPilot() {
         if (bundleDir == null || f2PilotDir == null ||
                 !isFoundationV3Source()) return;
-        append("\n=== F2 SFT ASSISTANT-ONLY LR PILOT ===");
+        append("\n=== " +
+                ("model0001_f2r_lr_pilot_v1".equals(f2PilotSchema)
+                        ? "F2R REPAIR LR PILOT"
+                        : "F2 SFT ASSISTANT-ONLY LR PILOT") +
+                " ===");
         updateAllModeButtons();
         if (f2PilotRun != null) f2PilotRun.setEnabled(false);
 
