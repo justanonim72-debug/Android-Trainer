@@ -84,6 +84,10 @@ jobs:
             tools/build_model0001_f2_sft_lr_pilot.py \
             tools/build_model0001_stage_package.py
 
+      - name: F2 source runtime smoke
+        run: |
+          python tools/build_model0001_f2_sft_source.py --runtime-smoke
+
       - name: Guard public repository against local model data
         shell: bash
         run: |
