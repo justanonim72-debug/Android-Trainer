@@ -76,6 +76,10 @@ jobs:
             tools/build_model0001_dataset_v3.py \
             tools/build_model0001_v3_lr_pilot.py \
             tools/lock_model0001_v3_production_recipe.py \
+            tools/promote_model0001_foundation_v3_checkpoint.py \
+            tools/acquire_model0001_f2_sft_sources.py \
+            tools/build_model0001_f2_sft_source.py \
+            tools/pack_model0001_f2_sft.py \
             tools/build_model0001_stage_package.py
 
       - name: Guard public repository against local model data
