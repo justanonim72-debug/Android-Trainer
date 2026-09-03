@@ -38,16 +38,16 @@ NativePilotResult runNativeModel0001SftLrPilot(
     const std::string& pilotRoot,
     const std::string& workDir);
 
+struct NativeStageResult {
+    bool pass = false;
+    std::string json;
+};
+
 // Runs or resumes the locked Friend-Core F2 assistant-only SFT stage.
 NativeStageResult runNativeModel0001SftStage(
     const Bundle& bundle,
     const std::string& stageRoot,
     const std::string& workDir);
-
-struct NativeStageResult {
-    bool pass = false;
-    std::string json;
-};
 
 // Runs or resumes the recipe-driven Foundation-v3 production stage.
 // The stage package is data+recipe only; source weights come from the same
