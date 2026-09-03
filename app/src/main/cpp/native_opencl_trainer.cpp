@@ -1395,6 +1395,178 @@ PilotPackageData loadPilotPackage(const std::string& root) {
 }
 
 
+struct SftWindowDataFile {
+    std::string tokensRelativePath;
+    std::string maskRelativePath;
+    std::vector<uint16_t> tokens;
+    std::vector<uint8_t> masks;
+    int windows = 0;
+};
+
+struct SftPilotPackageData {
+    std::vector<double> lrCandidates;
+    std::vector<int> trainIndices;
+    std::vector<int> sftEvalIndices;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+    int trainSteps = 0;
+    int warmupSteps = 0;
+    SftWindowDataFile train;
+    SftWindowDataFile sftValidation;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+};
+
+SftWindowDataFile loadSftWindowDataFile(
+    const std::string& root, const rapidjson::Value& data,
+    const char* key) {
+    req(data.HasMember(key) && data[key].IsObject(),
+        std::string("SFT pilot data manifest missing: ") + key);
+    const auto& spec = data[key];
+    req(spec.HasMember("tokens_path") && spec["tokens_path"].IsString() &&
+            spec.HasMember("mask_path") && spec["mask_path"].IsString() &&
+            spec.HasMember("windows") && spec["windows"].IsInt() &&
+            spec.HasMember("tokens_per_window") &&
+            spec["tokens_per_window"].IsInt() &&
+            spec["tokens_per_window"].GetInt() == S + 1 &&
+            spec.HasMember("mask_targets_per_window") &&
+            spec["mask_targets_per_window"].IsInt() &&
+            spec["mask_targets_per_window"].GetInt() == S,
+        std::string("invalid SFT window data spec: ") + key);
+
+    SftWindowDataFile file;
+    file.tokensRelativePath = spec["tokens_path"].GetString();
+    file.maskRelativePath = spec["mask_path"].GetString();
+    file.windows = spec["windows"].GetInt();
+    req(file.windows > 0, "SFT pilot data has zero windows");
+
+    file.tokens = readU16LeFile(
+        safePilotPath(root, file.tokensRelativePath));
+    const auto maskBytes = readBinaryFile(
+        safePilotPath(root, file.maskRelativePath));
+    file.masks.assign(maskBytes.begin(), maskBytes.end());
+
+    req(file.tokens.size() ==
+            static_cast<size_t>(file.windows) * (S + 1),
+        "SFT token-window count mismatch");
+    req(file.masks.size() ==
+            static_cast<size_t>(file.windows) * S,
+        "SFT mask-window count mismatch");
+    for (uint8_t value : file.masks) {
+        req(value == 0 || value == 1,
+            "SFT loss mask must be binary");
+    }
+    return file;
+}
+
+SftPilotPackageData loadSftPilotPackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid SFT pilot manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_f2_sft_lr_pilot_v1",
+        "unsupported SFT pilot schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "SFT pilot source model SHA mismatch");
+    req(doc.HasMember("objective") && doc["objective"].IsString() &&
+            std::string(doc["objective"].GetString()) ==
+                "assistant_content_only_cross_entropy",
+        "SFT pilot objective drift");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "SFT pilot hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("assistant_only_loss") &&
+            guards["assistant_only_loss"].IsBool() &&
+            guards["assistant_only_loss"].GetBool(),
+        "SFT pilot assistant-only guard missing");
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "SFT pilot package contains test split");
+    req(guards.HasMember("dataset_v2_train_bin_packaged") &&
+            guards["dataset_v2_train_bin_packaged"].IsBool() &&
+            !guards["dataset_v2_train_bin_packaged"].GetBool(),
+        "SFT pilot package contains Dataset-v2 train");
+    req(guards.HasMember("foundation_v3_train_bin_packaged") &&
+            guards["foundation_v3_train_bin_packaged"].IsBool() &&
+            !guards["foundation_v3_train_bin_packaged"].GetBool(),
+        "SFT pilot package contains Foundation-v3 train");
+
+    req(doc.HasMember("protocol") && doc["protocol"].IsObject(),
+        "SFT pilot protocol missing");
+    const auto& protocol = doc["protocol"];
+    req(protocol.HasMember("train_steps_per_candidate") &&
+            protocol["train_steps_per_candidate"].IsInt() &&
+            protocol.HasMember("warmup_steps") &&
+            protocol["warmup_steps"].IsInt() &&
+            protocol.HasMember("lr_candidates") &&
+            protocol["lr_candidates"].IsArray(),
+        "SFT pilot protocol malformed");
+
+    SftPilotPackageData result;
+    result.trainSteps = protocol["train_steps_per_candidate"].GetInt();
+    result.warmupSteps = protocol["warmup_steps"].GetInt();
+    req(result.trainSteps == 96 && result.warmupSteps == 3,
+        "SFT pilot step/warmup contract drift");
+    for (const auto& value : protocol["lr_candidates"].GetArray()) {
+        req(value.IsNumber(), "SFT pilot LR candidate is not numeric");
+        const double lr = value.GetDouble();
+        req(std::isfinite(lr) && lr >= 1.0e-5 && lr <= 5.0e-5,
+            "SFT pilot LR outside locked full-SFT range");
+        result.lrCandidates.push_back(lr);
+    }
+    req(result.lrCandidates.size() == 3,
+        "SFT pilot must contain exactly three LR candidates");
+
+    req(doc.HasMember("indices") && doc["indices"].IsObject(),
+        "SFT pilot indices missing");
+    const auto& indices = doc["indices"];
+    result.trainIndices = readIndexArray(indices, "train");
+    result.sftEvalIndices = readIndexArray(indices, "sft_validation");
+    result.v3EvalIndices = readIndexArray(indices, "v3_validation");
+    result.v1EvalIndices = readIndexArray(indices, "v1_validation");
+    req(static_cast<int>(result.trainIndices.size()) == result.trainSteps,
+        "SFT pilot train index count mismatch");
+    req(result.sftEvalIndices.size() == 24 &&
+            result.v3EvalIndices.size() == 24 &&
+            result.v1EvalIndices.size() == 24,
+        "SFT pilot eval-window count drift");
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "SFT pilot data section missing");
+    const auto& data = doc["data"];
+    result.train = loadSftWindowDataFile(root, data, "sft_train");
+    result.sftValidation =
+        loadSftWindowDataFile(root, data, "sft_validation");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("SFT pilot index outside ") + label);
+        }
+    };
+    validateIndices(result.trainIndices, result.train.windows, "SFT train");
+    validateIndices(
+        result.sftEvalIndices, result.sftValidation.windows, "SFT validation");
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows, "V3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows, "V1 validation");
+    return result;
+}
+
+
 struct StagePackageData {
     std::string recipeSha256;
     std::string stageName;
@@ -1630,6 +1802,7 @@ public:
 
     NativeGateResult run(const std::function<double()>& cpuBaseline);
     NativePilotResult runPilot(const PilotPackageData& pilot);
+    NativePilotResult runSftPilot(const SftPilotPackageData& pilot);
     NativeStageResult runStage(const StagePackageData& stage);
     const std::string& currentStage() const { return currentStage_; }
 
@@ -1785,8 +1958,12 @@ private:
     float readLoss();
     float readGlobalNorm();
     void setWindowFromU16(const PilotDataFile& data, int windowIndex);
+    int setWindowFromSft(
+        const SftWindowDataFile& data, int windowIndex);
     double evaluateCe(
         const PilotDataFile& data, const std::vector<int>& indices);
+    double evaluateSftCe(
+        const SftWindowDataFile& data, const std::vector<int>& indices);
 
     std::vector<float> gather(cl_mem source, const std::vector<int>& indices);
     ForwardGate checkForward();
