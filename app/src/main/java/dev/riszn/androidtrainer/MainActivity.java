@@ -5,7 +5,10 @@ import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.net.Uri;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -15,6 +18,7 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
+import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -52,6 +56,8 @@ public final class MainActivity extends Activity {
     }
 
     private TextView log;
+    private ScrollView logScroller;
+    private ScrollView pageScroller;
     private Button run;
     private Button pilotRun;
     private Button productionRun;
@@ -83,24 +89,64 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         powerManager = (PowerManager) getSystemService(POWER_SERVICE);
 
+        // The whole screen is scrollable. The previous layout placed the long
+        // workflow above a weighted log panel, which could collapse the log to
+        // almost zero height on phones. Keep the workflow compact and give the
+        // output console a real, independently scrollable viewport.
+        pageScroller = new ScrollView(this);
+        pageScroller.setFillViewport(true);
+        pageScroller.setVerticalScrollBarEnabled(true);
+        pageScroller.setScrollbarFadingEnabled(false);
+        pageScroller.setBackgroundColor(0xff0d0f12);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(28, 28, 28, 28);
-        root.setBackgroundColor(0xff101114);
+        root.setPadding(dp(18), dp(18), dp(18), dp(28));
+        pageScroller.addView(
+                root,
+                new ScrollView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout header = card();
+        header.setPadding(dp(18), dp(16), dp(18), dp(16));
 
         TextView title = new TextView(this);
         title.setText("MODEL #0001  •  TRAINER");
-        title.setTextColor(0xfff1f3f4);
-        title.setTextSize(20);
+        title.setTextColor(0xfff5f7fa);
+        title.setTextSize(24);
+        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setGravity(Gravity.CENTER_VERTICAL);
-        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
+        header.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         TextView subtitle = new TextView(this);
         subtitle.setText("Native OpenCL FP32 • Foundation + F2 SFT workflow");
-        subtitle.setTextColor(0xff9aa0a6);
+        subtitle.setTextColor(0xff9da4ad);
         subtitle.setTextSize(13);
-        subtitle.setPadding(0, 6, 0, 20);
-        root.addView(subtitle, new LinearLayout.LayoutParams(-1, -2));
+        subtitle.setPadding(0, dp(6), 0, 0);
+        header.addView(subtitle, new LinearLayout.LayoutParams(-1, -2));
+
+        root.addView(header, sectionParams(dp(0), dp(12)));
+
+        LinearLayout workflowHeader = new LinearLayout(this);
+        workflowHeader.setOrientation(LinearLayout.HORIZONTAL);
+        workflowHeader.setGravity(Gravity.CENTER_VERTICAL);
+        workflowHeader.setPadding(dp(4), dp(4), dp(4), dp(8));
+
+        TextView workflowTitle = new TextView(this);
+        workflowTitle.setText("WORKFLOW STEPS");
+        workflowTitle.setTextColor(0xffc7cdd4);
+        workflowTitle.setTextSize(12);
+        workflowTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        workflowTitle.setLetterSpacing(0.08f);
+        workflowHeader.addView(
+                workflowTitle,
+                new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView scrollHint = pill("↕  Scroll");
+        workflowHeader.addView(scrollHint);
+
+        root.addView(workflowHeader, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.VERTICAL);
@@ -119,7 +165,6 @@ public final class MainActivity extends Activity {
         buttons.addView(select);
 
         run = button("4. Run full native OpenCL training gate");
-
         run.setEnabled(false);
         run.setOnClickListener(v -> runGate());
         buttons.addView(run);
@@ -165,28 +210,76 @@ public final class MainActivity extends Activity {
         f2ProductionRun.setOnClickListener(v -> runF2SftStage());
         buttons.addView(f2ProductionRun);
 
-        Button export = button("Export last JSON report");
-        export.setOnClickListener(v -> exportReport());
-        buttons.addView(export);
-
-        Button exportCrash = button("Export native crash trace");
-        exportCrash.setOnClickListener(v -> exportNativeTrace());
-        buttons.addView(exportCrash);
-
         root.addView(buttons, new LinearLayout.LayoutParams(-1, -2));
 
-        log = new TextView(this);
-        log.setTextColor(0xffd7dadc);
-        log.setTextSize(12);
-        log.setTextIsSelectable(true);
-        log.setTypeface(android.graphics.Typeface.MONOSPACE);
-        log.setPadding(0, 20, 0, 40);
-        log.setText("No bundle loaded.\n");
+        LinearLayout outputCard = card();
+        LinearLayout.LayoutParams outputCardLp = sectionParams(dp(14), dp(12));
 
-        ScrollView scroller = new ScrollView(this);
-        scroller.addView(log);
-        root.addView(scroller, new LinearLayout.LayoutParams(-1, 0, 1f));
-        setContentView(root);
+        LinearLayout outputHeader = new LinearLayout(this);
+        outputHeader.setOrientation(LinearLayout.HORIZONTAL);
+        outputHeader.setGravity(Gravity.CENTER_VERTICAL);
+        outputHeader.setPadding(dp(14), dp(12), dp(14), dp(8));
+
+        TextView outputTitle = new TextView(this);
+        outputTitle.setText(">_  LIVE OUTPUT");
+        outputTitle.setTextColor(0xffe6e9ed);
+        outputTitle.setTextSize(13);
+        outputTitle.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        outputHeader.addView(
+                outputTitle,
+                new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView live = pill("●  Live");
+        live.setTextColor(0xff73e59b);
+        outputHeader.addView(live);
+
+        outputCard.addView(outputHeader, new LinearLayout.LayoutParams(-1, -2));
+
+        log = new TextView(this);
+        log.setTextColor(0xffd9dde3);
+        log.setTextSize(11.5f);
+        log.setTextIsSelectable(true);
+        log.setTypeface(Typeface.MONOSPACE);
+        log.setLineSpacing(0f, 1.12f);
+        log.setPadding(dp(14), dp(8), dp(14), dp(14));
+        log.setText("Waiting for output…\n");
+
+        logScroller = new ScrollView(this);
+        logScroller.setFillViewport(true);
+        logScroller.setVerticalScrollBarEnabled(true);
+        logScroller.setScrollbarFadingEnabled(false);
+        logScroller.setNestedScrollingEnabled(true);
+        logScroller.setBackgroundColor(0xff0a0c0f);
+        logScroller.addView(
+                log,
+                new ScrollView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout.LayoutParams logLp =
+                new LinearLayout.LayoutParams(-1, dp(260));
+        logLp.setMargins(dp(10), 0, dp(10), dp(12));
+        outputCard.addView(logScroller, logLp);
+        root.addView(outputCard, outputCardLp);
+
+        TextView outputHint = new TextView(this);
+        outputHint.setText(
+                "Output stays here while the workflow runs. Swipe inside the console "
+                + "for older lines; swipe outside it to move through the page.");
+        outputHint.setTextColor(0xff7f8791);
+        outputHint.setTextSize(11);
+        outputHint.setPadding(dp(4), 0, dp(4), dp(8));
+        root.addView(outputHint, new LinearLayout.LayoutParams(-1, -2));
+
+        Button export = actionButton("⇩  Export last JSON report");
+        export.setOnClickListener(v -> exportReport());
+        root.addView(export);
+
+        Button exportCrash = actionButton("⇩  Export native crash trace");
+        exportCrash.setOnClickListener(v -> exportNativeTrace());
+        root.addView(exportCrash);
+
+        setContentView(pageScroller);
         showPreviousExitDiagnostics();
         restoreExistingPackages();
         handleLaunchIntent(getIntent());
@@ -308,18 +401,104 @@ public final class MainActivity extends Activity {
         return "UNKNOWN";
     }
 
+    private int dp(int value) {
+        return Math.round(
+                value * getResources().getDisplayMetrics().density);
+    }
+
+    private GradientDrawable roundedBackground(
+            int fillColor, int strokeColor, int radiusDp) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(fillColor);
+        bg.setCornerRadius(dp(radiusDp));
+        if (strokeColor != 0) bg.setStroke(dp(1), strokeColor);
+        return bg;
+    }
+
+    private LinearLayout card() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(
+                roundedBackground(0xff15181d, 0xff292e36, 16));
+        if (Build.VERSION.SDK_INT >= 21) card.setElevation(dp(1));
+        return card;
+    }
+
+    private LinearLayout.LayoutParams sectionParams(
+            int topMargin, int bottomMargin) {
+        LinearLayout.LayoutParams lp =
+                new LinearLayout.LayoutParams(-1, -2);
+        lp.setMargins(0, topMargin, 0, bottomMargin);
+        return lp;
+    }
+
+    private TextView pill(String text) {
+        TextView v = new TextView(this);
+        v.setText(text);
+        v.setTextColor(0xffaab1ba);
+        v.setTextSize(11);
+        v.setGravity(Gravity.CENTER);
+        v.setPadding(dp(10), dp(6), dp(10), dp(6));
+        v.setBackground(
+                roundedBackground(0xff1c2026, 0xff2b3139, 99));
+        return v;
+    }
+
     private Button button(String text) {
         Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.setMargins(0, 5, 0, 5);
+        b.setTextSize(13.5f);
+        b.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        b.setPadding(dp(16), 0, dp(14), 0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setBackgroundTintList(new ColorStateList(
+                new int[][]{
+                    new int[]{-android.R.attr.state_enabled},
+                    new int[]{android.R.attr.state_pressed},
+                    new int[]{}
+                },
+                new int[]{
+                    0xff1d2025,
+                    0xff343a43,
+                    0xff2a2f36
+                }));
+        b.setTextColor(new ColorStateList(
+                new int[][]{
+                    new int[]{-android.R.attr.state_enabled},
+                    new int[]{}
+                },
+                new int[]{
+                    0xff666d76,
+                    0xfff0f2f5
+                }));
+        LinearLayout.LayoutParams lp =
+                new LinearLayout.LayoutParams(-1, dp(54));
+        lp.setMargins(0, dp(4), 0, dp(4));
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private Button actionButton(String text) {
+        Button b = button(text);
+        b.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams lp =
+                new LinearLayout.LayoutParams(-1, dp(56));
+        lp.setMargins(0, dp(4), 0, dp(4));
         b.setLayoutParams(lp);
         return b;
     }
 
     private void append(String s) {
-        runOnUiThread(() -> log.append(s + "\n"));
+        runOnUiThread(() -> {
+            if (log == null) return;
+            log.append(s + "\n");
+            if (logScroller != null) {
+                logScroller.post(() ->
+                        logScroller.fullScroll(View.FOCUS_DOWN));
+            }
+        });
     }
 
     private void background(String label, Job job) {
