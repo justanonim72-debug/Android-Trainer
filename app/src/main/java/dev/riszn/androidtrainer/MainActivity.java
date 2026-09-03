@@ -69,6 +69,8 @@ public final class MainActivity extends Activity {
     private File stageDir;
     private File f2PilotDir;
     private File f2StageDir;
+    private String f2PilotSchema = "";
+    private String f2StageSchema = "";
     private String bundleModelStateSha = "";
     private File lastTrainingCheckpoint;
     private volatile boolean trainingActive = false;
@@ -192,20 +194,20 @@ public final class MainActivity extends Activity {
         exportCheckpoint.setOnClickListener(v -> exportTrainingCheckpoint());
         buttons.addView(exportCheckpoint);
 
-        Button selectF2Pilot = button("10. Import F2 SFT LR pilot package");
+        Button selectF2Pilot = button("10. Import masked SFT LR pilot package");
         selectF2Pilot.setOnClickListener(v -> selectF2Pilot());
         buttons.addView(selectF2Pilot);
 
-        f2PilotRun = button("11. Run F2 assistant-only LR pilot");
+        f2PilotRun = button("11. Run assistant-only LR pilot");
         f2PilotRun.setEnabled(false);
         f2PilotRun.setOnClickListener(v -> runF2SftLrPilot());
         buttons.addView(f2PilotRun);
 
-        Button selectF2Stage = button("12. Import locked F2 SFT .atsftstage");
+        Button selectF2Stage = button("12. Import locked masked SFT stage");
         selectF2Stage.setOnClickListener(v -> selectF2Stage());
         buttons.addView(selectF2Stage);
 
-        f2ProductionRun = button("13. Run / resume F2 SFT training");
+        f2ProductionRun = button("13. Run / resume masked SFT training");
         f2ProductionRun.setEnabled(false);
         f2ProductionRun.setOnClickListener(v -> runF2SftStage());
         buttons.addView(f2ProductionRun);
@@ -708,7 +710,7 @@ public final class MainActivity extends Activity {
                 if (!dest.mkdirs() && !dest.isDirectory())
                     throw new IllegalStateException("cannot create F2 pilot dir");
                 unzipSafely(zip, dest);
-                verifyF2PilotFiles(dest);
+                f2PilotSchema = verifyF2PilotFiles(dest);
                 f2PilotDir = dest;
                 append("f2_sft_pilot_sha256: " + packageSha);
                 append("F2 SFT pilot package verification: PASS");
@@ -719,33 +721,45 @@ public final class MainActivity extends Activity {
         }, "android-trainer-f2-pilot-import").start();
     }
 
-    private void verifyF2PilotFiles(File root) throws Exception {
+    private String verifyF2PilotFiles(File root) throws Exception {
         File manifestFile = new File(root, "manifest.json");
         if (!manifestFile.isFile())
-            throw new IllegalStateException("F2 pilot manifest.json missing");
+            throw new IllegalStateException("masked SFT pilot manifest.json missing");
         String text = new String(
                 java.nio.file.Files.readAllBytes(manifestFile.toPath()),
                 java.nio.charset.StandardCharsets.UTF_8);
         JSONObject manifest = new JSONObject(text);
-        if (!"model0001_f2_sft_lr_pilot_v1".equals(
-                manifest.getString("schema")))
-            throw new IllegalStateException("wrong F2 pilot schema");
+        String schema = manifest.getString("schema");
+        boolean repair = "model0001_f2r_lr_pilot_v1".equals(schema);
+        if (!"model0001_f2_sft_lr_pilot_v1".equals(schema) && !repair)
+            throw new IllegalStateException("wrong masked SFT pilot schema");
         if (!"10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b"
                 .equals(manifest.getString("source_model_state_sha256")))
-            throw new IllegalStateException("F2 pilot source-model SHA mismatch");
+            throw new IllegalStateException("masked SFT pilot source-model SHA mismatch");
         if (!"assistant_content_only_cross_entropy".equals(
                 manifest.getString("objective")))
-            throw new IllegalStateException("F2 pilot objective drift");
+            throw new IllegalStateException("masked SFT pilot objective drift");
 
         JSONObject guards = manifest.getJSONObject("hard_guards");
         if (!guards.getBoolean("assistant_only_loss"))
-            throw new IllegalStateException("F2 pilot mask guard missing");
+            throw new IllegalStateException("masked SFT pilot mask guard missing");
         if (guards.getBoolean("test_split_packaged"))
-            throw new IllegalStateException("F2 pilot contains test split");
+            throw new IllegalStateException("masked SFT pilot contains test split");
         if (guards.getBoolean("dataset_v2_train_bin_packaged"))
-            throw new IllegalStateException("F2 pilot contains Dataset-v2 train");
+            throw new IllegalStateException("masked SFT pilot contains Dataset-v2 train");
         if (guards.getBoolean("foundation_v3_train_bin_packaged"))
-            throw new IllegalStateException("F2 pilot contains Foundation-v3 train");
+            throw new IllegalStateException("masked SFT pilot contains Foundation-v3 train");
+        if (repair) {
+            if (!"friend_f2r_repair_sft".equals(
+                    manifest.getString("stage_objective")))
+                throw new IllegalStateException("F2R pilot stage objective drift");
+            if (!guards.getBoolean("record_isolated_packing"))
+                throw new IllegalStateException("F2R record-isolated guard missing");
+            if (guards.getInt("cross_record_windows") != 0)
+                throw new IllegalStateException("F2R cross-record windows detected");
+            if (guards.getBoolean("behavior_eval_prompts_used_for_train"))
+                throw new IllegalStateException("F2R behavior-eval prompt leak");
+        }
 
         JSONObject data = manifest.getJSONObject("data");
         String[] masked = new String[]{"sft_train", "sft_validation"};
@@ -755,18 +769,17 @@ public final class MainActivity extends Activity {
             File tokens = canonicalChild(root, spec.getString("tokens_path"));
             File mask = canonicalChild(root, spec.getString("mask_path"));
             if (!tokens.isFile() || !mask.isFile())
-                throw new IllegalStateException("F2 pilot masked data missing: " + key);
+                throw new IllegalStateException("masked SFT pilot data missing: " + key);
             if (tokens.length() != (long) windows * 257L * 2L)
-                throw new IllegalStateException("F2 token-window size mismatch: " + key);
+                throw new IllegalStateException("masked SFT token-window size mismatch: " + key);
             if (mask.length() != (long) windows * 256L)
-                throw new IllegalStateException("F2 mask-window size mismatch: " + key);
+                throw new IllegalStateException("masked SFT mask-window size mismatch: " + key);
             if (!sha256(tokens).equalsIgnoreCase(spec.getString("tokens_sha256")))
-                throw new IllegalStateException("F2 tokens SHA mismatch: " + key);
+                throw new IllegalStateException("masked SFT tokens SHA mismatch: " + key);
             if (!sha256(mask).equalsIgnoreCase(spec.getString("mask_sha256")))
-                throw new IllegalStateException("F2 mask SHA mismatch: " + key);
+                throw new IllegalStateException("masked SFT mask SHA mismatch: " + key);
         }
-        String[] retention = new String[]{"v3_validation", "v1_validation"};
-        for (String key : retention) {
+        for (String key : new String[]{"v3_validation", "v1_validation"}) {
             JSONObject spec = data.getJSONObject(key);
             File file = canonicalChild(root, spec.getString("path"));
             if (!file.isFile())
@@ -776,6 +789,7 @@ public final class MainActivity extends Activity {
             if (!sha256(file).equalsIgnoreCase(spec.getString("sha256")))
                 throw new IllegalStateException("retention SHA mismatch: " + key);
         }
+        return schema;
     }
 
 
@@ -789,7 +803,7 @@ public final class MainActivity extends Activity {
     }
 
     private void importF2Stage(Uri uri) {
-        append("\n=== IMPORT F2 SFT PRODUCTION STAGE ===");
+        append("\n=== IMPORT MASKED SFT PRODUCTION STAGE ===");
         if (f2ProductionRun != null) f2ProductionRun.setEnabled(false);
         new Thread(() -> {
             try {
@@ -809,10 +823,10 @@ public final class MainActivity extends Activity {
                 if (!dest.mkdirs() && !dest.isDirectory())
                     throw new IllegalStateException("cannot create F2 stage dir");
                 unzipSafely(zip, dest);
-                verifyF2StageFiles(dest);
+                f2StageSchema = verifyF2StageFiles(dest);
                 f2StageDir = dest;
                 append("f2_sft_stage_sha256: " + packageSha);
-                append("F2 SFT production stage verification: PASS");
+                append("masked SFT production stage verification: PASS");
                 runOnUiThread(this::updateF2ProductionEnabled);
             } catch (Throwable t) {
                 append("F2 STAGE IMPORT FAIL: " + t);
@@ -820,66 +834,82 @@ public final class MainActivity extends Activity {
         }, "android-trainer-f2-stage-import").start();
     }
 
-    private void verifyF2StageFiles(File root) throws Exception {
+    private String verifyF2StageFiles(File root) throws Exception {
         File manifestFile = new File(root, "manifest.json");
         if (!manifestFile.isFile())
-            throw new IllegalStateException("F2 stage manifest.json missing");
+            throw new IllegalStateException("masked SFT stage manifest.json missing");
         String text = new String(
                 java.nio.file.Files.readAllBytes(manifestFile.toPath()),
                 java.nio.charset.StandardCharsets.UTF_8);
         JSONObject manifest = new JSONObject(text);
-        if (!"model0001_f2_sft_stage_package_v1".equals(
-                manifest.getString("schema")))
-            throw new IllegalStateException("wrong F2 stage schema");
+        String schema = manifest.getString("schema");
+        boolean repair = "model0001_f2r_stage_package_v1".equals(schema);
+        if (!"model0001_f2_sft_stage_package_v1".equals(schema) && !repair)
+            throw new IllegalStateException("wrong masked SFT stage schema");
         if (!"10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b"
                 .equals(manifest.getString("source_model_state_sha256")))
-            throw new IllegalStateException("F2 stage source-model SHA mismatch");
+            throw new IllegalStateException("masked SFT stage source-model SHA mismatch");
         if (!"assistant_content_only_cross_entropy".equals(
                 manifest.getString("objective")))
-            throw new IllegalStateException("F2 stage objective drift");
+            throw new IllegalStateException("masked SFT stage objective drift");
+
         JSONObject guards = manifest.getJSONObject("hard_guards");
         if (!guards.getBoolean("assistant_only_loss"))
-            throw new IllegalStateException("F2 stage assistant-only guard missing");
+            throw new IllegalStateException("masked SFT assistant-only guard missing");
         if (guards.getBoolean("test_split_packaged"))
-            throw new IllegalStateException("F2 stage contains test split");
+            throw new IllegalStateException("masked SFT stage contains test split");
         if (guards.getBoolean("foundation_v3_train_bin_packaged"))
-            throw new IllegalStateException("F2 stage contains Foundation-v3 train");
+            throw new IllegalStateException("masked SFT stage contains Foundation-v3 train");
+        if (repair) {
+            if (!guards.getBoolean("record_isolated_packing"))
+                throw new IllegalStateException("F2R stage record-isolation guard missing");
+            if (guards.getInt("cross_record_windows") != 0)
+                throw new IllegalStateException("F2R stage cross-record windows detected");
+            if (guards.getBoolean("behavior_eval_prompts_used_for_train"))
+                throw new IllegalStateException("F2R stage behavior-eval prompt leak");
+        }
 
         JSONObject recipe = manifest.getJSONObject("recipe");
-        if (!"friend_f2_sft".equals(recipe.getString("stage_name")))
-            throw new IllegalStateException("F2 stage-name drift");
+        String expectedStage = repair ? "friend_f2r_repair_sft" : "friend_f2_sft";
+        String expectedRecipeSchema = repair
+                ? "model0001_f2r_stage_recipe_v1"
+                : "model0001_f2_sft_stage_recipe_v1";
+        if (!expectedStage.equals(recipe.getString("stage_name")))
+            throw new IllegalStateException("masked SFT stage-name drift");
+        if (!expectedRecipeSchema.equals(recipe.getString("schema")))
+            throw new IllegalStateException("masked SFT recipe schema drift");
         if (!"fresh_zero_moments".equals(recipe.getString("optimizer_init")))
-            throw new IllegalStateException("F2 optimizer-init drift");
+            throw new IllegalStateException("masked SFT optimizer-init drift");
         if (recipe.getBoolean("test_split_used"))
-            throw new IllegalStateException("F2 recipe touches test split");
+            throw new IllegalStateException("masked SFT recipe touches test split");
 
         JSONObject data = manifest.getJSONObject("data");
-        String[] masked = new String[]{"sft_train", "sft_validation"};
-        for (String key : masked) {
+        for (String key : new String[]{"sft_train", "sft_validation"}) {
             JSONObject spec = data.getJSONObject(key);
             int windows = spec.getInt("windows");
             File tokens = canonicalChild(root, spec.getString("tokens_path"));
             File mask = canonicalChild(root, spec.getString("mask_path"));
             if (!tokens.isFile() || !mask.isFile())
-                throw new IllegalStateException("F2 stage masked data missing: " + key);
+                throw new IllegalStateException("masked SFT stage data missing: " + key);
             if (tokens.length() != (long) windows * 257L * 2L)
-                throw new IllegalStateException("F2 stage tokens size mismatch: " + key);
+                throw new IllegalStateException("masked SFT stage tokens size mismatch: " + key);
             if (mask.length() != (long) windows * 256L)
-                throw new IllegalStateException("F2 stage mask size mismatch: " + key);
+                throw new IllegalStateException("masked SFT stage mask size mismatch: " + key);
             if (!sha256(tokens).equalsIgnoreCase(spec.getString("tokens_sha256")))
-                throw new IllegalStateException("F2 stage tokens SHA mismatch: " + key);
+                throw new IllegalStateException("masked SFT stage tokens SHA mismatch: " + key);
             if (!sha256(mask).equalsIgnoreCase(spec.getString("mask_sha256")))
-                throw new IllegalStateException("F2 stage mask SHA mismatch: " + key);
+                throw new IllegalStateException("masked SFT stage mask SHA mismatch: " + key);
         }
         for (String key : new String[]{"v3_validation", "v1_validation"}) {
             JSONObject spec = data.getJSONObject(key);
             File file = canonicalChild(root, spec.getString("path"));
             if (!file.isFile() ||
                     file.length() != spec.getLong("uint16_tokens") * 2L)
-                throw new IllegalStateException("F2 retention data mismatch: " + key);
+                throw new IllegalStateException("masked SFT retention data mismatch: " + key);
             if (!sha256(file).equalsIgnoreCase(spec.getString("sha256")))
-                throw new IllegalStateException("F2 retention SHA mismatch: " + key);
+                throw new IllegalStateException("masked SFT retention SHA mismatch: " + key);
         }
+        return schema;
     }
 
     private void selectStage() {
@@ -1042,7 +1072,7 @@ public final class MainActivity extends Activity {
                 File existingF2Pilot =
                         new File(getFilesDir(), "f2_sft_pilot_bundle");
                 if (existingF2Pilot.isDirectory()) {
-                    verifyF2PilotFiles(existingF2Pilot);
+                    f2PilotSchema = verifyF2PilotFiles(existingF2Pilot);
                     f2PilotDir = existingF2Pilot;
                     append("restored F2 SFT LR pilot package");
                 }
@@ -1053,7 +1083,7 @@ public final class MainActivity extends Activity {
                 File existingF2Stage =
                         new File(getFilesDir(), "f2_sft_stage_bundle");
                 if (existingF2Stage.isDirectory()) {
-                    verifyF2StageFiles(existingF2Stage);
+                    f2StageSchema = verifyF2StageFiles(existingF2Stage);
                     f2StageDir = existingF2Stage;
                     append("restored F2 SFT production stage package");
                 }
@@ -1277,7 +1307,7 @@ public final class MainActivity extends Activity {
     private void runF2SftStage() {
         if (bundleDir == null || f2StageDir == null ||
                 !isFoundationV3Source() || trainingActive) return;
-        append("\n=== F2 SFT PRODUCTION TRAINING ===");
+        append("\n=== MASKED SFT PRODUCTION TRAINING ===");
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         trainingActive = true;
         updateAllModeButtons();
@@ -1354,8 +1384,11 @@ public final class MainActivity extends Activity {
     private void startF2ProgressWatcher() {
         new Thread(() -> {
             String previous = "";
-            File progress =
-                    new File(getFilesDir(), "model0001-f2-sft-progress.json");
+            String progressName =
+                    "model0001_f2r_stage_package_v1".equals(f2StageSchema)
+                            ? "model0001-f2r-progress.json"
+                            : "model0001-f2-sft-progress.json";
+            File progress = new File(getFilesDir(), progressName);
             while (trainingActive) {
                 try {
                     if (progress.isFile()) {
@@ -1367,7 +1400,7 @@ public final class MainActivity extends Activity {
                             JSONObject p = new JSONObject(raw);
                             append(String.format(
                                     Locale.ROOT,
-                                    "F2 %d/%d  %.2f%%  scored=%d  lr=%.3g  loss=%s  sft=%s  v3=%s  v1=%s",
+                                    "SFT %d/%d  %.2f%%  scored=%d  lr=%.3g  loss=%s  sft=%s  v3=%s  v1=%s",
                                     p.optInt("optimizer_step", 0),
                                     p.optInt("total_updates", 0),
                                     100.0 * p.optDouble("fraction_complete", 0.0),
@@ -1591,6 +1624,12 @@ public final class MainActivity extends Activity {
             } else if ("model0001_f2_sft_stage_report_v1".equals(
                     reportObj.optString("schema"))) {
                 reportPrefix = "model0001-f2-sft-stage-";
+            } else if ("model0001_f2r_lr_pilot_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                reportPrefix = "model0001-f2r-lr-pilot-";
+            } else if ("model0001_f2r_stage_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                reportPrefix = "model0001-f2r-stage-";
             }
         } catch (Exception ignored) {}
         values.put(MediaStore.MediaColumns.DISPLAY_NAME,
@@ -1638,6 +1677,12 @@ public final class MainActivity extends Activity {
             } else if ("model0001_f2_sft_stage_report_v1".equals(
                     reportObj.optString("schema"))) {
                 title = "model0001-f2-sft-stage-report.json";
+            } else if ("model0001_f2r_lr_pilot_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                title = "model0001-f2r-lr-pilot-report.json";
+            } else if ("model0001_f2r_stage_report_v1".equals(
+                    reportObj.optString("schema"))) {
+                title = "model0001-f2r-stage-report.json";
             }
         } catch (Exception ignored) {}
         i.putExtra(Intent.EXTRA_TITLE, title);
