@@ -617,34 +617,44 @@ __kernel void silu_multiply_backward(
 __kernel void cross_entropy_forward_backward(
     __global const float* logits,
     __global const int* targets,
+    __global const int* lossMask,
     __global float* rowLoss,
     __global float* dlogits,
     int rows,
-    int vocab) {
+    int vocab,
+    int activeRows) {
     int row = (int)get_global_id(0);
     if (row >= rows) return;
     int base = row * vocab;
+    int active = lossMask[row] != 0;
+    if (!active) {
+        rowLoss[row] = 0.0f;
+        for (int j = 0; j < vocab; ++j) dlogits[base + j] = 0.0f;
+        return;
+    }
     float mx = -3.402823466e+38F;
     for (int j = 0; j < vocab; ++j) mx = fmax(mx, logits[base + j]);
     float den = 0.0f;
     for (int j = 0; j < vocab; ++j) den += exp(logits[base + j] - mx);
     rowLoss[row] = -(logits[base + targets[row]] - mx - log(den));
     float inv = 1.0f / den;
-    float mean = 1.0f / (float)rows;
+    float mean = 1.0f / (float)activeRows;
     for (int j = 0; j < vocab; ++j) {
         float p = exp(logits[base + j] - mx) * inv;
-        dlogits[base + j] = (p - (j == targets[row] ? 1.0f : 0.0f)) * mean;
+        dlogits[base + j] =
+            (p - (j == targets[row] ? 1.0f : 0.0f)) * mean;
     }
 }
 
 __kernel void mean_rows(
     __global const float* rows,
     __global float* out,
-    int n) {
+    int n,
+    int activeRows) {
     if (get_global_id(0) != 0) return;
     float acc = 0.0f;
     for (int i = 0; i < n; ++i) acc += rows[i];
-    out[0] = acc / (float)n;
+    out[0] = acc / (float)activeRows;
 }
 
 __kernel void embedding_add(
@@ -1641,6 +1651,8 @@ private:
 
     cl_mem tokens_ = nullptr;
     cl_mem targets_ = nullptr;
+    cl_mem lossMask_ = nullptr;
+    int activeLossRows_ = S;
     cl_mem ropeCos_ = nullptr;
     cl_mem ropeSin_ = nullptr;
     cl_mem uniqueTokenIds_ = nullptr;
@@ -1733,6 +1745,8 @@ private:
     void resetToSourceState();
     void initializeInputs();
     void setTrainingWindow(const int32_t* tokens257);
+    void setTrainingWindowMasked(
+        const int32_t* tokens257, const int32_t* lossMask256);
     void setLearningRate(float lr);
     void initializeActivations();
     void wireLayers();
@@ -1897,6 +1911,7 @@ void NativeTrainer::wireLayers() {
 void NativeTrainer::initializeInputs() {
     tokens_ = runtime_.allocate(S * sizeof(int32_t));
     targets_ = runtime_.allocate(S * sizeof(int32_t));
+    lossMask_ = runtime_.allocate(S * sizeof(int32_t));
 
     std::vector<float> cosines(S * HD), sines(S * HD);
     for (int position = 0; position < S; ++position) {
@@ -1929,13 +1944,31 @@ void NativeTrainer::initializeInputs() {
 }
 
 void NativeTrainer::setTrainingWindow(const int32_t* tokens257) {
+    std::array<int32_t, S> fullMask{};
+    fullMask.fill(1);
+    setTrainingWindowMasked(tokens257, fullMask.data());
+}
+
+void NativeTrainer::setTrainingWindowMasked(
+    const int32_t* tokens257, const int32_t* lossMask256) {
     req(tokens257 != nullptr, "null training window");
+    req(lossMask256 != nullptr, "null training loss mask");
+    int active = 0;
     for (int i = 0; i <= S; ++i) {
         req(tokens257[i] >= 0 && tokens257[i] < V,
             "training window token out of vocabulary");
+        if (i < S) {
+            req(lossMask256[i] == 0 || lossMask256[i] == 1,
+                "training loss mask must be binary");
+            active += lossMask256[i];
+        }
     }
+    req(active > 0 && active <= S,
+        "training loss mask must score at least one target");
+    activeLossRows_ = active;
     runtime_.write(tokens_, tokens257, S * sizeof(int32_t));
     runtime_.write(targets_, tokens257 + 1, S * sizeof(int32_t));
+    runtime_.write(lossMask_, lossMask256, S * sizeof(int32_t));
 
     std::map<int32_t, std::vector<int32_t>> byToken;
     for (int position = 0; position < S; ++position) {
@@ -2353,15 +2386,18 @@ void NativeTrainer::forward() {
     const int vocab = V;
     runtime_.argument(ce, 0, logits_);
     runtime_.argument(ce, 1, targets_);
-    runtime_.argument(ce, 2, rowLoss_);
-    runtime_.argument(ce, 3, dLogits_);
-    runtime_.argument(ce, 4, rows);
-    runtime_.argument(ce, 5, vocab);
+    runtime_.argument(ce, 2, lossMask_);
+    runtime_.argument(ce, 3, rowLoss_);
+    runtime_.argument(ce, 4, dLogits_);
+    runtime_.argument(ce, 5, rows);
+    runtime_.argument(ce, 6, vocab);
+    runtime_.argument(ce, 7, activeLossRows_);
     runtime_.enqueue1(ce, rows);
     cl_kernel mean = runtime_.kernel("mean_rows");
     runtime_.argument(mean, 0, rowLoss_);
     runtime_.argument(mean, 1, loss_);
     runtime_.argument(mean, 2, rows);
+    runtime_.argument(mean, 3, activeLossRows_);
     runtime_.enqueue1(mean, 1, 1);
 }
 
