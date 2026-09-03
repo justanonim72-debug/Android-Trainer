@@ -84,6 +84,9 @@ jobs:
             tools/build_model0001_f2_sft_lr_pilot.py \
             tools/build_model0001_f2_sft_stage_package.py \
             tools/lock_model0001_f2_sft_production_recipe.py \
+            tools/model0001_inference_runtime.py \
+            tools/run_model0001_post_f2_behavior_eval.py \
+            tools/chat_model0001_f2.py \
             tools/build_model0001_stage_package.py
 
       - name: F2 source runtime smoke
