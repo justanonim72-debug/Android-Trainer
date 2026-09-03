@@ -436,8 +436,8 @@ def validate_record(row):
     )
 
 def runtime_smoke_test():
-    rows=deterministic_protocol_records(32)
-    if len(rows)!=32:
+    rows=deterministic_protocol_records(500)
+    if len(rows)!=500:
         raise SystemExit("STOP: F2 deterministic protocol smoke count mismatch")
     ids=[r["id"] for r in rows]
     if len(ids)!=len(set(ids)):
