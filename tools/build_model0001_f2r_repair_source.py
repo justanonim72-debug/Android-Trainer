@@ -416,12 +416,35 @@ def build_behavior_core():
 
     return rows
 
+def runtime_smoke():
+    rows=build_behavior_core()
+    ids=[r["id"] for r in rows]
+    if len(rows)<300:
+        raise SystemExit("STOP: F2R behavior core smoke produced too few records")
+    if len(ids)!=len(set(ids)):
+        raise SystemExit("STOP: F2R behavior core smoke duplicate ids")
+    if not all(r["source_family"]=="repair_behavior_core" for r in rows):
+        raise SystemExit("STOP: F2R behavior core source-family drift")
+    if not all(r["split"] in ("train","validation") for r in rows):
+        raise SystemExit("STOP: F2R behavior core split drift")
+    print(json.dumps({
+      "status":"PASS",
+      "schema":"model0001_f2r_repair_runtime_smoke_v1",
+      "records":len(rows),
+      "train":sum(r["split"]=="train" for r in rows),
+      "validation":sum(r["split"]=="validation" for r in rows)
+    },sort_keys=True))
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--project",default="/storage/emulated/0/Download/friend_core_corpus_bootstrap_v1")
     ap.add_argument("--collapse-audit",default="/storage/emulated/0/Download/model0001-f2-collapse-audit.json")
     ap.add_argument("--suite",default=None)
+    ap.add_argument("--runtime-smoke",action="store_true")
     args=ap.parse_args()
+    if args.runtime_smoke:
+        runtime_smoke()
+        return
 
     project=Path(args.project).resolve()
     source=project/"data"/"f2_sft"/"friend_f2_sft_source.jsonl"
