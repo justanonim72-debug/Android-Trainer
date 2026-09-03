@@ -1567,6 +1567,282 @@ SftPilotPackageData loadSftPilotPackage(const std::string& root) {
 }
 
 
+struct SftStagePackageData {
+    std::string recipeSha256;
+    std::string stageName;
+    int totalUpdates = 0;
+    int maxEpochs = 0;
+    int checkpointEvery = 0;
+    int evalEvery = 0;
+    int logEvery = 0;
+    bool constantSchedule = false;
+    double peakLr = 0.0;
+    double minLr = 0.0;
+    int warmupSteps = 0;
+    SftWindowDataFile train;
+    SftWindowDataFile sftValidation;
+    PilotDataFile v3Validation;
+    PilotDataFile v1Validation;
+    std::vector<int> sftEvalIndices;
+    std::vector<int> v3EvalIndices;
+    std::vector<int> v1EvalIndices;
+};
+
+SftStagePackageData loadSftStagePackage(const std::string& root) {
+    const std::string json = readTextFile(root + "/manifest.json");
+    rapidjson::Document doc;
+    doc.Parse(json.c_str(), json.size());
+    req(!doc.HasParseError() && doc.IsObject(),
+        "invalid F2 SFT stage manifest.json");
+    req(doc.HasMember("schema") && doc["schema"].IsString() &&
+            std::string(doc["schema"].GetString()) ==
+                "model0001_f2_sft_stage_package_v1",
+        "unsupported F2 SFT stage package schema");
+    req(doc.HasMember("source_model_state_sha256") &&
+            doc["source_model_state_sha256"].IsString() &&
+            std::string(doc["source_model_state_sha256"].GetString()) ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+        "F2 SFT stage source model SHA mismatch");
+    req(doc.HasMember("objective") && doc["objective"].IsString() &&
+            std::string(doc["objective"].GetString()) ==
+                "assistant_content_only_cross_entropy",
+        "F2 SFT production objective drift");
+    req(doc.HasMember("recipe_sha256") && doc["recipe_sha256"].IsString(),
+        "F2 SFT recipe SHA missing");
+    req(doc.HasMember("hard_guards") && doc["hard_guards"].IsObject(),
+        "F2 SFT stage hard guards missing");
+    const auto& guards = doc["hard_guards"];
+    req(guards.HasMember("assistant_only_loss") &&
+            guards["assistant_only_loss"].IsBool() &&
+            guards["assistant_only_loss"].GetBool(),
+        "F2 SFT assistant-only guard missing");
+    req(guards.HasMember("test_split_packaged") &&
+            guards["test_split_packaged"].IsBool() &&
+            !guards["test_split_packaged"].GetBool(),
+        "F2 SFT stage package contains test split");
+    req(guards.HasMember("foundation_v3_train_bin_packaged") &&
+            guards["foundation_v3_train_bin_packaged"].IsBool() &&
+            !guards["foundation_v3_train_bin_packaged"].GetBool(),
+        "F2 SFT stage package contains Foundation-v3 train");
+
+    req(doc.HasMember("recipe") && doc["recipe"].IsObject(),
+        "F2 SFT recipe missing");
+    const auto& recipe = doc["recipe"];
+    SftStagePackageData result;
+    result.recipeSha256 = doc["recipe_sha256"].GetString();
+    req(result.recipeSha256.size() == 64,
+        "F2 SFT recipe SHA length invalid");
+    req(recipe.HasMember("schema") && recipe["schema"].IsString() &&
+            std::string(recipe["schema"].GetString()) ==
+                "model0001_f2_sft_stage_recipe_v1",
+        "F2 SFT recipe schema drift");
+    req(recipe.HasMember("stage_name") && recipe["stage_name"].IsString() &&
+            std::string(recipe["stage_name"].GetString()) ==
+                "friend_f2_sft",
+        "F2 SFT stage name drift");
+    result.stageName = recipe["stage_name"].GetString();
+    req(recipe.HasMember("total_updates") &&
+            recipe["total_updates"].IsInt() &&
+            recipe["total_updates"].GetInt() > 0,
+        "F2 SFT total_updates invalid");
+    result.totalUpdates = recipe["total_updates"].GetInt();
+    req(recipe.HasMember("max_epochs") && recipe["max_epochs"].IsInt() &&
+            recipe["max_epochs"].GetInt() >= 1 &&
+            recipe["max_epochs"].GetInt() <= 3,
+        "F2 SFT max_epochs invalid");
+    result.maxEpochs = recipe["max_epochs"].GetInt();
+    req(recipe.HasMember("optimizer_init") &&
+            recipe["optimizer_init"].IsString() &&
+            std::string(recipe["optimizer_init"].GetString()) ==
+                "fresh_zero_moments",
+        "F2 SFT optimizer init drift");
+    req(recipe.HasMember("source_foundation_lifetime_tokens") &&
+            recipe["source_foundation_lifetime_tokens"].IsInt() &&
+            recipe["source_foundation_lifetime_tokens"].GetInt() == 6563072,
+        "F2 SFT source lifetime boundary drift");
+
+    req(recipe.HasMember("optimizer") && recipe["optimizer"].IsObject(),
+        "F2 SFT optimizer missing");
+    const auto& optimizer = recipe["optimizer"];
+    req(optimizer.HasMember("name") && optimizer["name"].IsString() &&
+            std::string(optimizer["name"].GetString()) == "AdamW",
+        "F2 SFT optimizer must be AdamW");
+    req(optimizer.HasMember("betas") && optimizer["betas"].IsArray() &&
+            optimizer["betas"].Size() == 2 &&
+            std::abs(optimizer["betas"][0].GetDouble() - 0.9) <= 1.0e-12 &&
+            std::abs(optimizer["betas"][1].GetDouble() - 0.95) <= 1.0e-12,
+        "F2 SFT AdamW betas drift");
+    req(optimizer.HasMember("eps") && optimizer["eps"].IsNumber() &&
+            std::abs(optimizer["eps"].GetDouble() - 1.0e-8) <= 1.0e-16,
+        "F2 SFT AdamW eps drift");
+    req(optimizer.HasMember("grad_clip") &&
+            optimizer["grad_clip"].IsNumber() &&
+            std::abs(optimizer["grad_clip"].GetDouble() - 1.0) <= 1.0e-12,
+        "F2 SFT grad clip drift");
+
+    req(recipe.HasMember("sample_order") &&
+            recipe["sample_order"].IsObject(),
+        "F2 SFT sample_order missing");
+    const auto& order = recipe["sample_order"];
+    req(order.HasMember("type") && order["type"].IsString() &&
+            std::string(order["type"].GetString()) ==
+                "sequential_masked_windows",
+        "F2 SFT sample order drift");
+    req(order.HasMember("seed") && order["seed"].IsInt() &&
+            order["seed"].GetInt() == 20260903,
+        "F2 SFT sample-order seed drift");
+
+    req(recipe.HasMember("checkpoint_every") &&
+            recipe["checkpoint_every"].IsInt() &&
+            recipe["checkpoint_every"].GetInt() > 0 &&
+            recipe.HasMember("eval_every") &&
+            recipe["eval_every"].IsInt() &&
+            recipe["eval_every"].GetInt() > 0 &&
+            recipe.HasMember("log_every") &&
+            recipe["log_every"].IsInt() &&
+            recipe["log_every"].GetInt() > 0,
+        "F2 SFT cadence invalid");
+    result.checkpointEvery = recipe["checkpoint_every"].GetInt();
+    result.evalEvery = recipe["eval_every"].GetInt();
+    result.logEvery = recipe["log_every"].GetInt();
+    req(recipe.HasMember("test_split_used") &&
+            recipe["test_split_used"].IsBool() &&
+            !recipe["test_split_used"].GetBool(),
+        "F2 SFT test split must remain untouched");
+
+    req(recipe.HasMember("lr_schedule") &&
+            recipe["lr_schedule"].IsObject(),
+        "F2 SFT LR schedule missing");
+    const auto& schedule = recipe["lr_schedule"];
+    req(schedule.HasMember("type") && schedule["type"].IsString(),
+        "F2 SFT LR schedule type missing");
+    const std::string scheduleType = schedule["type"].GetString();
+    if (scheduleType == "constant") {
+        req(schedule.HasMember("lr") && schedule["lr"].IsNumber(),
+            "F2 SFT constant LR missing");
+        result.constantSchedule = true;
+        result.peakLr = schedule["lr"].GetDouble();
+        result.minLr = result.peakLr;
+        result.warmupSteps = 0;
+    } else {
+        req(scheduleType == "linear_warmup_cosine",
+            "unsupported F2 SFT LR schedule");
+        req(schedule.HasMember("peak_lr") &&
+                schedule["peak_lr"].IsNumber() &&
+                schedule.HasMember("min_lr") &&
+                schedule["min_lr"].IsNumber() &&
+                schedule.HasMember("warmup_steps") &&
+                schedule["warmup_steps"].IsInt(),
+            "F2 SFT warmup/cosine schedule malformed");
+        result.constantSchedule = false;
+        result.peakLr = schedule["peak_lr"].GetDouble();
+        result.minLr = schedule["min_lr"].GetDouble();
+        result.warmupSteps = schedule["warmup_steps"].GetInt();
+    }
+    req(std::isfinite(result.peakLr) && std::isfinite(result.minLr) &&
+            result.peakLr >= 1.0e-6 && result.peakLr <= 5.0e-5 &&
+            result.minLr >= 1.0e-6 &&
+            result.minLr <= result.peakLr,
+        "F2 SFT production LR range invalid");
+    if (!result.constantSchedule) {
+        req(result.warmupSteps > 0 &&
+                result.warmupSteps < result.totalUpdates,
+            "F2 SFT warmup length invalid");
+    }
+
+    req(doc.HasMember("data") && doc["data"].IsObject(),
+        "F2 SFT data section missing");
+    const auto& data = doc["data"];
+    result.train = loadSftWindowDataFile(root, data, "sft_train");
+    result.sftValidation =
+        loadSftWindowDataFile(root, data, "sft_validation");
+    result.v3Validation =
+        loadPilotDataFile(root, data, "v3_validation");
+    result.v1Validation =
+        loadPilotDataFile(root, data, "v1_validation");
+    req(result.totalUpdates <=
+            result.train.windows * result.maxEpochs,
+        "F2 SFT total_updates exceeds explicit max_epochs");
+
+    req(doc.HasMember("eval_indices") &&
+            doc["eval_indices"].IsObject(),
+        "F2 SFT eval indices missing");
+    const auto& eval = doc["eval_indices"];
+    result.sftEvalIndices = readIndexArray(eval, "sft_validation");
+    result.v3EvalIndices = readIndexArray(eval, "v3_validation");
+    result.v1EvalIndices = readIndexArray(eval, "v1_validation");
+
+    auto validateIndices = [](const std::vector<int>& values, int limit,
+                              const char* label) {
+        for (int value : values) {
+            req(value >= 0 && value < limit,
+                std::string("F2 SFT eval index outside ") + label);
+        }
+    };
+    validateIndices(
+        result.sftEvalIndices, result.sftValidation.windows,
+        "SFT validation");
+    validateIndices(
+        result.v3EvalIndices, result.v3Validation.fullWindows,
+        "V3 validation");
+    validateIndices(
+        result.v1EvalIndices, result.v1Validation.fullWindows,
+        "V1 validation");
+    return result;
+}
+
+double sftStageLearningRate(
+    const SftStagePackageData& stage, int updateIndex) {
+    req(updateIndex >= 0 && updateIndex < stage.totalUpdates,
+        "F2 SFT LR update index invalid");
+    if (stage.constantSchedule) return stage.peakLr;
+    const int updateNumber = updateIndex + 1;
+    if (updateNumber <= stage.warmupSteps) {
+        return stage.peakLr *
+            static_cast<double>(updateNumber) /
+            static_cast<double>(stage.warmupSteps);
+    }
+    const int decaySteps = stage.totalUpdates - stage.warmupSteps;
+    const double progress = std::min(
+        1.0,
+        std::max(
+            0.0,
+            static_cast<double>(updateNumber - stage.warmupSteps) /
+                static_cast<double>(decaySteps)));
+    constexpr double PI = 3.1415926535897932384626433832795;
+    const double cosine = 0.5 * (1.0 + std::cos(PI * progress));
+    return stage.minLr +
+        (stage.peakLr - stage.minLr) * cosine;
+}
+
+int sftWindowActiveTargets(
+    const SftWindowDataFile& data, int windowIndex) {
+    req(windowIndex >= 0 && windowIndex < data.windows,
+        "F2 SFT active-target window out of range");
+    const size_t offset = static_cast<size_t>(windowIndex) * S;
+    int active = 0;
+    for (int i = 0; i < S; ++i) {
+        active += static_cast<int>(
+            data.masks[offset + static_cast<size_t>(i)]);
+    }
+    req(active > 0 && active <= S,
+        "F2 SFT window has invalid active-target count");
+    return active;
+}
+
+uint64_t sftScoredTargetsBeforeStep(
+    const SftStagePackageData& stage, uint64_t step) {
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < step; ++i) {
+        const int windowIndex =
+            static_cast<int>(i % static_cast<uint64_t>(stage.train.windows));
+        total += static_cast<uint64_t>(
+            sftWindowActiveTargets(stage.train, windowIndex));
+    }
+    return total;
+}
+
+
 struct StagePackageData {
     std::string recipeSha256;
     std::string stageName;
@@ -1803,6 +2079,7 @@ public:
     NativeGateResult run(const std::function<double()>& cpuBaseline);
     NativePilotResult runPilot(const PilotPackageData& pilot);
     NativePilotResult runSftPilot(const SftPilotPackageData& pilot);
+    NativeStageResult runSftStage(const SftStagePackageData& stage);
     NativeStageResult runStage(const StagePackageData& stage);
     const std::string& currentStage() const { return currentStage_; }
 
