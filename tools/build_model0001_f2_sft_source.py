@@ -378,10 +378,32 @@ def validate_record(row):
         for m in msgs
     )
 
+def runtime_smoke_test():
+    rows=deterministic_protocol_records(32)
+    if len(rows)!=32:
+        raise SystemExit("STOP: F2 deterministic protocol smoke count mismatch")
+    ids=[r["id"] for r in rows]
+    if len(ids)!=len(set(ids)):
+        raise SystemExit("STOP: F2 deterministic protocol smoke duplicate IDs")
+    ranked=sorted(ids,key=stable_rank)
+    if ranked!=sorted(ids,key=stable_rank):
+        raise SystemExit("STOP: F2 stable ranking is nondeterministic")
+    if not all(r["split"] in ("train","validation") for r in rows):
+        raise SystemExit("STOP: F2 deterministic protocol smoke split invalid")
+    print(json.dumps({
+        "status":"PASS",
+        "schema":"model0001_f2_source_runtime_smoke_v1",
+        "records":len(rows)
+    },sort_keys=True))
+
 def main():
     ap=argparse.ArgumentParser()
+    ap.add_argument("--runtime-smoke",action="store_true")
     ap.add_argument("--project",default="/storage/emulated/0/Download/friend_core_corpus_bootstrap_v1")
     args=ap.parse_args()
+    if args.runtime_smoke:
+        runtime_smoke_test()
+        return
     project=Path(args.project).resolve()
     manifest_path=project/"data"/"raw_f2_sft_sources"/"SOURCE_MANIFEST.json"
     if not manifest_path.is_file():
