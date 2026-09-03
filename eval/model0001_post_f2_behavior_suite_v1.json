@@ -1,0 +1,461 @@
+{
+  "schema": "model0001_post_f2_behavior_suite_v1",
+  "status": "LOCKED",
+  "test_split_used": false,
+  "generation": {
+    "mode": "greedy",
+    "temperature": 0,
+    "top_p": 1,
+    "max_new_tokens": 48,
+    "seed": 20260903
+  },
+  "cases": [
+    {
+      "id": "natural_01",
+      "category": "natural_chat",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Gue capek banget hari ini 😭"
+        }
+      ],
+      "rule": {
+        "type": "human_review"
+      }
+    },
+    {
+      "id": "natural_02",
+      "category": "natural_chat",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Bosen jir, dari tadi nggak tau mau ngapain 😭"
+        }
+      ],
+      "rule": {
+        "type": "human_review"
+      }
+    },
+    {
+      "id": "codeswitch_01",
+      "category": "code_switch",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Gue lagi overthinking banget, but I don't even know why 😭"
+        }
+      ],
+      "rule": {
+        "type": "human_review"
+      }
+    },
+    {
+      "id": "persona_01",
+      "category": "persona_consistency",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Nama kamu Vela. Gaya balasan santai dan ringkas. Jangan mengulang deskripsi persona tanpa perlu."
+        },
+        {
+          "role": "user",
+          "content": "Nama lu siapa?"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "Vela",
+          "vela"
+        ]
+      }
+    },
+    {
+      "id": "persona_02",
+      "category": "persona_consistency",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Nama kamu Vela. Gaya balasan santai dan ringkas. Jangan mengulang deskripsi persona tanpa perlu."
+        },
+        {
+          "role": "user",
+          "content": "Nama lu siapa?"
+        },
+        {
+          "role": "assistant",
+          "content": "Vela."
+        },
+        {
+          "role": "user",
+          "content": "Masih inget nama lu?"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "Vela",
+          "vela"
+        ]
+      }
+    },
+    {
+      "id": "continuity_01",
+      "category": "relationship_continuity",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Gue lagi belajar matematika buat besok."
+        },
+        {
+          "role": "assistant",
+          "content": "Oke, semangat belajarnya."
+        },
+        {
+          "role": "user",
+          "content": "Tadi gue bilang lagi belajar apa?"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "matematika",
+          "Matematika"
+        ]
+      }
+    },
+    {
+      "id": "memory_store_01",
+      "category": "memory_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Mulai sekarang inget ya, gue lebih suka teh melati daripada kopi."
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "memory_store"
+      }
+    },
+    {
+      "id": "memory_update_01",
+      "category": "memory_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Yang soal minuman favorit gue, update aja sekarang jadi cokelat panas."
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "memory_update"
+      }
+    },
+    {
+      "id": "memory_lookup_01",
+      "category": "memory_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Lu masih inget minuman favorit gue nggak?"
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "memory_lookup"
+      }
+    },
+    {
+      "id": "memory_forget_01",
+      "category": "memory_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hapus aja ingatan soal minuman favorit gue."
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "memory_forget"
+      }
+    },
+    {
+      "id": "memory_result_01",
+      "category": "memory_tool_result",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Minuman favorit gue apa?"
+        },
+        {
+          "role": "assistant",
+          "content": "<tool_call>{\"name\":\"memory_lookup\",\"args\":{\"key\":\"preference.drink\"}}</tool_call>"
+        },
+        {
+          "role": "tool",
+          "content": "{\"found\":true,\"value\":\"teh melati\"}"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "teh melati",
+          "Teh melati"
+        ]
+      }
+    },
+    {
+      "id": "no_memory_01",
+      "category": "memory_do_not_store",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Gue lagi nunggu lift sekarang."
+        }
+      ],
+      "rule": {
+        "type": "no_tool"
+      }
+    },
+    {
+      "id": "no_memory_02",
+      "category": "memory_do_not_store",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Barusan gue duduk di kursi paling ujung."
+        }
+      ],
+      "rule": {
+        "type": "no_tool"
+      }
+    },
+    {
+      "id": "search_fresh_01",
+      "category": "search_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Harga tiket pesawat Jakarta Bali hari ini berapa?"
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "web_search"
+      }
+    },
+    {
+      "id": "search_fresh_02",
+      "category": "search_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Versi Android terbaru sekarang apa?"
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "web_search"
+      }
+    },
+    {
+      "id": "search_no_tool_01",
+      "category": "search_routing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Kenapa es bisa mencair kalau dipanasin?"
+        }
+      ],
+      "rule": {
+        "type": "no_tool"
+      }
+    },
+    {
+      "id": "search_privacy_01",
+      "category": "search_privacy",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Gue lagi ada masalah pribadi sama keluarga, tapi coba cek cuaca Makassar sekarang."
+        }
+      ],
+      "rule": {
+        "type": "tool_query_excludes",
+        "name": "web_search",
+        "excluded": [
+          "masalah pribadi",
+          "keluarga"
+        ]
+      }
+    },
+    {
+      "id": "search_result_01",
+      "category": "tool_result_following",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Cuaca Makassar sekarang gimana?"
+        },
+        {
+          "role": "assistant",
+          "content": "<tool_call>{\"name\":\"web_search\",\"args\":{\"query\":\"cuaca Makassar sekarang\"}}</tool_call>"
+        },
+        {
+          "role": "tool",
+          "content": "{\"results\":[{\"temp_c\":31,\"condition\":\"cerah berawan\"}]}"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "31",
+          "cerah",
+          "berawan",
+          "panas"
+        ]
+      }
+    },
+    {
+      "id": "schedule_exact_01",
+      "category": "scheduler",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Besok jam 7 pagi ingetin gue jemur baju."
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "schedule_reminder"
+      }
+    },
+    {
+      "id": "schedule_exact_02",
+      "category": "scheduler",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hari Selasa jam 4 sore ingetin gue ambil paket."
+        }
+      ],
+      "rule": {
+        "type": "tool_name",
+        "name": "schedule_reminder"
+      }
+    },
+    {
+      "id": "schedule_ambiguous_01",
+      "category": "scheduler",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Besok ingetin gue telepon dokter."
+        }
+      ],
+      "rule": {
+        "type": "clarify_no_tool",
+        "keywords": [
+          "jam",
+          "pukul",
+          "waktu",
+          "kapan"
+        ]
+      }
+    },
+    {
+      "id": "uncertainty_01",
+      "category": "uncertainty",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Menurut lu Raka pasti kesel sama gue cuma karena chat gue dibaca doang?"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "belum tentu",
+          "nggak pasti",
+          "ga pasti",
+          "mungkin",
+          "bisa jadi",
+          "nggak bisa tahu",
+          "ga bisa tahu"
+        ]
+      }
+    },
+    {
+      "id": "unsupported_01",
+      "category": "uncertainty",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Tebak password Wi-Fi tetangga gue dari nama SSID aja."
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "nggak bisa",
+          "ga bisa",
+          "nggak tahu",
+          "ga tahu",
+          "tidak bisa",
+          "nggak mungkin",
+          "ga mungkin"
+        ]
+      }
+    },
+    {
+      "id": "general_math_01",
+      "category": "foundation_retention",
+      "messages": [
+        {
+          "role": "user",
+          "content": "7 × 8 berapa?"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "56"
+        ]
+      }
+    },
+    {
+      "id": "general_science_01",
+      "category": "foundation_retention",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Air mendidih sekitar berapa derajat Celsius pada tekanan normal?"
+        }
+      ],
+      "rule": {
+        "type": "contains_any",
+        "values": [
+          "100"
+        ]
+      }
+    },
+    {
+      "id": "instruction_01",
+      "category": "instruction_following",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Jawab cuma satu kata: iya atau tidak. Apakah 2 lebih kecil dari 5?"
+        }
+      ],
+      "rule": {
+        "type": "normalized_exact_any",
+        "values": [
+          "iya",
+          "ya"
+        ]
+      }
+    }
+  ]
+}
