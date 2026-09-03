@@ -4430,6 +4430,42 @@ NativePilotResult runNativeModel0001LrPilot(
 }
 
 
+
+NativePilotResult runNativeModel0001SftLrPilot(
+    const Bundle& bundle,
+    const std::string& pilotRoot,
+    const std::string& workDir) {
+    static bool completed = false;
+    static NativePilotResult cached;
+    if (completed) return cached;
+    NativeTrainer* trainer = nullptr;
+    try {
+        req(bundle.modelStateSha256 ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+            "F2 SFT pilot requires promoted Foundation-v3 source bundle");
+        const SftPilotPackageData pilot = loadSftPilotPackage(pilotRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        cached = trainer->runSftPilot(pilot);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_f2_sft_lr_pilot_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(
+                trainer ? trainer->currentStage()
+                        : "native:sft_pilot:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":false"
+            << ",\"test_split_used\":false,\"pass\":false}";
+        cached = {false, out.str()};
+    }
+    completed = true;
+    return cached;
+}
+
+
 NativeStageResult runNativeModel0001Stage(
     const Bundle& bundle,
     const std::string& stageRoot,
