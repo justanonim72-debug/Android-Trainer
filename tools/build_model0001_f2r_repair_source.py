@@ -30,7 +30,6 @@ import math
 import re
 from pathlib import Path
 
-from tokenizers import Tokenizer
 
 SEED="20260903-f2r-source-v1"
 TOKENIZER_SHA="3ab25549638ef1a0b9e718218f402c40b0633455fd2fa2ffb7fd6369ff75d5d7"
@@ -472,6 +471,7 @@ def main():
     if source_validation.get("status")!="PASS" or source_validation.get("sha256")!=sha256(source):
         raise SystemExit("STOP: original F2 source validation mismatch")
 
+    from tokenizers import Tokenizer
     tok=Tokenizer.from_file(str(tokenizer_path))
     excluded_prompts=eval_prompt_norms(suite_path)
 
