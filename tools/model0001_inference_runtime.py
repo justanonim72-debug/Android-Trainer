@@ -306,7 +306,11 @@ def generate(model:Model0001Inference,tokenizer:Tokenizer,messages:list[dict],
     gen.manual_seed(seed)
     for _ in range(max_new_tokens):
         context=ids[-model.max_seq:]
-        x=torch.tensor([context],dtype=torch.long,next(model.buffers()).device)
+        x=torch.tensor(
+            [context],
+            dtype=torch.long,
+            device=next(model.buffers()).device
+        )
         logits=model(x)[0,-1].float().cpu()
         if temperature<=0:
             nxt=int(torch.argmax(logits))
