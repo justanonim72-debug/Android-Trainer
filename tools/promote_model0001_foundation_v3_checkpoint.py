@@ -30,6 +30,7 @@ EXPECTED_V3_TRAIN_SHA = "19c7d23661aee08d11ac243347d4b943661084f1dc6fa740a222de0
 EXPECTED_GEOMETRY = [256, 14000, 384, 8, 6, 2, 64, 1152]
 EXPECTED_PARAMS = 19_145_088
 EXPECTED_SLOTS = 74
+EXPECTED_PROMOTED_MODEL_SHA = "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b"
 
 def sha256_file(path: Path) -> str:
     h=hashlib.sha256()
@@ -187,6 +188,11 @@ def main():
                 raise SystemExit(f"STOP: slot weight-decay drift {name}")
 
         new_model_sha=tensor_state_hash(slots)
+        if new_model_sha != EXPECTED_PROMOTED_MODEL_SHA:
+            raise SystemExit(
+                "STOP: promoted Foundation-v3 model-state SHA mismatch: "
+                f"{new_model_sha} != {EXPECTED_PROMOTED_MODEL_SHA}"
+            )
         manifest["checkpoint_sha256"]=ckpt_sha
         manifest["model_state_sha256"]=new_model_sha
         manifest["train_bin_sha256"]=EXPECTED_V3_TRAIN_SHA
