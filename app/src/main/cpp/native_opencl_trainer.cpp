@@ -5009,6 +5009,37 @@ NativePilotResult runNativeModel0001SftLrPilot(
 }
 
 
+
+NativeStageResult runNativeModel0001SftStage(
+    const Bundle& bundle,
+    const std::string& stageRoot,
+    const std::string& workDir) {
+    NativeTrainer* trainer = nullptr;
+    try {
+        req(bundle.modelStateSha256 ==
+                "10836dbde12e6c1eb732c1b6695ed248af5754d038011058250e81593287d00b",
+            "F2 SFT production requires promoted Foundation-v3 source bundle");
+        const SftStagePackageData stage = loadSftStagePackage(stageRoot);
+        trainer = new NativeTrainer(bundle, workDir);
+        return trainer->runSftStage(stage);
+    } catch (const std::exception& error) {
+        std::ostringstream out;
+        out << "{\"status\":\"FAIL_NATIVE_EXCEPTION\""
+            << ",\"schema\":\"model0001_f2_sft_stage_report_v1\""
+            << ",\"backend\":\"PURE_OPENCL_C_1_2_FP32_BUFFER\""
+            << ",\"commit\":\"" << jsonEscape(ANDROID_TRAINER_GIT_COMMIT)
+            << "\",\"first_failing_stage\":\""
+            << jsonEscape(
+                trainer ? trainer->currentStage()
+                        : "native:f2_sft:initialize")
+            << "\",\"error\":\"" << jsonEscape(error.what())
+            << "\",\"production_lr_locked\":true"
+            << ",\"test_split_used\":false,\"pass\":false}";
+        return NativeStageResult{false, out.str()};
+    }
+}
+
+
 NativeStageResult runNativeModel0001Stage(
     const Bundle& bundle,
     const std::string& stageRoot,
