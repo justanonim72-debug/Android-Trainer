@@ -2807,6 +2807,43 @@ void NativeTrainer::setWindowFromU16(
     setTrainingWindow(window.data());
 }
 
+int NativeTrainer::setWindowFromSft(
+    const SftWindowDataFile& data, int windowIndex) {
+    req(windowIndex >= 0 && windowIndex < data.windows,
+        "SFT window index out of range");
+    const size_t tokenOffset =
+        static_cast<size_t>(windowIndex) * (S + 1);
+    const size_t maskOffset =
+        static_cast<size_t>(windowIndex) * S;
+    req(tokenOffset + S < data.tokens.size(),
+        "SFT token window exceeds file");
+    req(maskOffset + S <= data.masks.size(),
+        "SFT mask window exceeds file");
+
+    std::array<int32_t, S + 1> window{};
+    std::array<int32_t, S> mask{};
+    int active = 0;
+    for (int i = 0; i <= S; ++i) {
+        window[static_cast<size_t>(i)] =
+            static_cast<int32_t>(
+                data.tokens[tokenOffset + static_cast<size_t>(i)]);
+        if (i < S) {
+            const int value = static_cast<int>(
+                data.masks[maskOffset + static_cast<size_t>(i)]);
+            req(value == 0 || value == 1,
+                "SFT window mask must be binary");
+            mask[static_cast<size_t>(i)] = value;
+            active += value;
+        }
+    }
+    req(active > 0 && active <= S,
+        "SFT window has no scored assistant targets");
+    setTrainingWindowMasked(window.data(), mask.data());
+    req(activeLossRows_ == active,
+        "SFT active target count drift");
+    return active;
+}
+
 double NativeTrainer::evaluateCe(
     const PilotDataFile& data, const std::vector<int>& indices) {
     req(!indices.empty(), "empty pilot eval index set");
@@ -2820,6 +2857,27 @@ double NativeTrainer::evaluateCe(
     const double mean = static_cast<double>(
         total / static_cast<long double>(indices.size()));
     req(std::isfinite(mean), "nonfinite pilot validation CE");
+    return mean;
+}
+
+double NativeTrainer::evaluateSftCe(
+    const SftWindowDataFile& data, const std::vector<int>& indices) {
+    req(!indices.empty(), "empty SFT pilot eval index set");
+    long double weighted = 0.0;
+    uint64_t activeTargets = 0;
+    for (int index : indices) {
+        const int active = setWindowFromSft(data, index);
+        forward();
+        weighted +=
+            static_cast<long double>(readLoss()) *
+            static_cast<long double>(active);
+        activeTargets += static_cast<uint64_t>(active);
+    }
+    runtime_.finish();
+    req(activeTargets > 0, "SFT pilot eval has zero active targets");
+    const double mean = static_cast<double>(
+        weighted / static_cast<long double>(activeTargets));
+    req(std::isfinite(mean), "nonfinite SFT pilot validation CE");
     return mean;
 }
 
