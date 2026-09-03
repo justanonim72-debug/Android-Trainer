@@ -87,11 +87,18 @@ jobs:
             tools/model0001_inference_runtime.py \
             tools/run_model0001_post_f2_behavior_eval.py \
             tools/chat_model0001_f2.py \
+            tools/audit_model0001_f2_behavior_collapse.py \
+            tools/build_model0001_f2r_repair_source.py \
+            tools/pack_model0001_f2r_repair.py \
             tools/build_model0001_stage_package.py
 
       - name: F2 source runtime smoke
         run: |
           python tools/build_model0001_f2_sft_source.py --runtime-smoke
+
+      - name: F2R repair runtime smoke
+        run: |
+          python tools/build_model0001_f2r_repair_source.py --runtime-smoke
 
       - name: Guard public repository against local model data
         shell: bash
